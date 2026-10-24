@@ -44,8 +44,10 @@ def main():
     i = 0
     while i < len(args):
         if args[i] == "--put":
-            puts.append(tuple(args[i + 1].split(":", 1)))
-            i += 2
+            # Two arguments: local path then remote path (Windows paths contain
+            # a colon, so they cannot be joined with ":").
+            puts.append((args[i + 1], args[i + 2]))
+            i += 3
         else:
             script = args[i]
             i += 1

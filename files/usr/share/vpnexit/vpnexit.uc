@@ -751,38 +751,44 @@ function connect_impl(key, index, verify) {
 		return { ok: false, error: msg };
 	}
 
-	run("swanctl --terminate --ike " + CONN);
 	routing_clear();
 
-	// charon needs a moment to tear down the previous SA; initiating while it is
-	// still deleting produces "existing duplicate CHILD_SA" and the whole
-	// connect would be reported as failed.
-	for (let i = 0; i < 10; i++) {
-		let q = sas_parse();
-		if (!q.ike && !q.child) break;
-		sleep(500);
-	}
-
-	let r = run("swanctl --initiate --child " + CHILD + " --timeout 30");
-	let s = wait_child(12);
-	if (!s.child || !length(s.vip)) {
-		// One controlled retry: peers occasionally reject the first attempt while
-		// the previous SA is still expiring on their side.
+	// Peer selection: a server that never answers IKE_SA_INIT (down, rate
+	// limited, or filtered by the ISP) used to block the whole connect for
+	// 30 seconds. Try the remaining servers of the same location instead.
+	let cands = [];
+	for (let k = 0; k < length(loc.servers); k++) push(cands, (idx + k) % length(loc.servers));
+	let s = null, used = idx, lastErr = "";
+	for (let ci = 0; ci < length(cands) && ci < 3; ci++) {
+		let si = cands[ci];
+		let cand = loc.servers[si];
+		if (!length(cand.user) || !length(cand.pass)) continue;
+		if (ci > 0) log(sprintf("connect: %s did not answer, trying %s", srv.host, cand.host));
+		srv = cand;
+		learn_chain(cand.host);
+		write_conn(cand);
+		run("swanctl --load-creds");
+		let lc2 = run("swanctl --load-conns");
+		if (lc2.rc != 0) { lastErr = clean(lc2.out); continue; }
+		teardown();
+		let rr2 = run("swanctl --initiate --child " + CHILD + " --timeout 15");
+		let w = wait_child(8);
+		if (w.child && length(w.vip)) { s = w; used = si; break; }
+		lastErr = clean(rr2.out);
 		run("swanctl --terminate --ike " + CONN);
-		sleep(2000);
-		r = run("swanctl --initiate --child " + CHILD + " --timeout 30");
-		s = wait_child(12);
 	}
-	if (!s.child || !length(s.vip)) {
-		let msg = clean(r.out);
-		let m = match(msg, /\n[^\n]*(failed|error|no trusted|unable)[^\n]*/);
-		log("connect: handshake failed: " + msg);
-		run("swanctl --terminate --ike " + CONN);
-		state_patch({ state: "error", error: (m ? trim(m[0]) : "handshake failed") });
+	if (s == null) {
+		let m = match(lastErr, /\n[^\n]*(failed|error|no trusted|unable)[^\n]*/);
+		log("connect: handshake failed: " + lastErr);
+		state_patch({
+			state: "error", vip: "", exit_ip: "", checked_at: now(),
+			server_host: srv.host, index: used,
+			error: (m ? trim(m[0]) : "handshake failed")
+		});
 		return { ok: false, error: "handshake failed: " + (m ? trim(m[0]) : "no CHILD_SA") };
 	}
 
-	state_patch({ vip: s.vip, server_ip: s.remote, since: now(), checked_at: now() });
+	state_patch({ vip: s.vip, server_ip: s.remote, server_host: srv.host, index: used, since: now(), checked_at: now(), misses: 0 });
 	let routing = { active: false };
 	if (cfg_bool("share_lan", true)) {
 		let rr = routing_apply(s.vip);
@@ -848,7 +854,10 @@ function worker_alive() {
 function start_worker(key, idx) {
 	run("rm -rf " + shellq(RUN + "/lock"));
 	run("mkdir -p " + shellq(RUN + "/lock"));
-	state_patch({ state: "connecting", key: key, index: idx, error: "", checked_at: now() });
+	state_patch({
+		state: "connecting", key: key, index: idx, error: "",
+		vip: "", rx: 0, tx: 0, uptime: 0, checked_at: now()
+	});
 	let cmd = sprintf("setsid %s %s job-connect %s %d >/dev/null 2>&1 & echo $!",
 		"/usr/bin/ucode", "/usr/share/vpnexit/vpnexit.uc", shellq(key), idx);
 	let r = run(cmd);
@@ -910,6 +919,24 @@ function status_obj() {
 
 function supervise_once() {
 	let st = state_read();
+
+	// A connect/disconnect worker owns the tunnel while it runs. Interfering
+	// here used to kill the SA the worker was just building, which produced
+	// duplicate connects and the "handshake failed" loop.
+	if (worker_alive()) return;
+
+	// After a failure, keep trying periodically instead of staying dead: many
+	// peers come back after an outage, and the user should not have to click.
+	if (st.state == "error") {
+		if (!cfg_bool("auto_reconnect", true)) return;
+		let wait = cfg_int("retry_seconds", 120);
+		if (now() - intval(st.checked_at, 0) < wait) return;
+		log("watchdog: retrying after failure");
+		let rr = do_connect(st.key, intval(st.index, 0), false);
+		if (!rr.ok) state_patch({ state: "error", error: rr.error ?? "retry failed", checked_at: now() });
+		return;
+	}
+
 	if (st.state != "connected" && st.state != "connecting") return;
 
 	let s = sas_parse();
@@ -928,6 +955,13 @@ function supervise_once() {
 	}
 
 	// The child disappeared: either the peer dropped it or the WAN flapped.
+	// A single miss can just be a rekey in progress, so require two in a row.
+	let misses = intval(st.misses, 0) + 1;
+	if (misses < 2) {
+		state_patch({ misses: misses, checked_at: now() });
+		return;
+	}
+
 	let attempts = intval(st.attempts, 0) + 1;
 	let max = cfg_int("reconnect_attempts", 5);
 	log(sprintf("watchdog: tunnel lost (attempt %d/%d)", attempts, max));
@@ -939,9 +973,9 @@ function supervise_once() {
 		return;
 	}
 
-	state_patch({ state: "connecting", attempts: attempts, checked_at: now() });
+	state_patch({ state: "connecting", attempts: attempts, misses: 0, checked_at: now() });
 	let r = do_connect(st.key, intval(st.index, 0), false);
-	if (!r.ok) state_patch({ state: "error", error: r.error ?? "reconnect failed", attempts: attempts });
+	if (!r.ok) state_patch({ state: "error", error: r.error ?? "reconnect failed", attempts: attempts, checked_at: now() });
 }
 
 function supervise() {
