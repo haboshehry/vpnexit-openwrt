@@ -657,6 +657,14 @@ function routing_ruleset(vip, lan, wan, gw, server_ip, block_v6) {
 	push(t, sprintf("\t\tudp dport 53 meta mark set %s counter", mark));
 	push(t, sprintf("\t\ttcp dport 53 meta mark set %s counter", mark));
 	push(t, "\t}");
+	// Force clients that manually configured 1.1.1.1/8.8.8.8/etc. to use
+	// dnsmasq on the router, so a stale/filtered WAN resolver cannot return
+	// NXDOMAIN while the router itself has a valid answer.
+	push(t, "\tchain vpx_dnsredirect {");
+	push(t, "\t\ttype nat hook prerouting priority dstnat; policy accept;");
+	push(t, sprintf("\t\tiifname \"%s\" udp dport 53 redirect to :53", lan));
+	push(t, sprintf("\t\tiifname \"%s\" tcp dport 53 redirect to :53", lan));
+	push(t, "\t}");
 	if (block_v6) {
 		push(t, "\tchain vpx_v6 {");
 		push(t, "\t\ttype filter hook forward priority filter; policy accept;");
