@@ -1,59 +1,62 @@
-"""Tiny SSH helper for the router (password auth, no sftp subsystem needed).
+#!/usr/bin/env python3
+"""Run a local shell script on the router over SSH (password auth).
 
-usage:
-  python rssh.py run "<shell command>"
-  python rssh.py put <local-file> <remote-path>
+usage: rssh.py <script.sh> [--put local:remote]...
+The router password is read from ROUTER_PASS, never from the command line.
 """
-import base64
+import os
 import sys
 
 import paramiko
 
-HOST = "192.168.1.1"
-USER = "root"
-PASS = "Xo0ox@xo0oX"
+HOST = os.environ.get("ROUTER_HOST", "192.168.1.1")
+USER = os.environ.get("ROUTER_USER", "root")
 
 
 def connect():
-    c = paramiko.SSHClient()
-    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(HOST, username=USER, password=PASS, timeout=20,
-              banner_timeout=20, auth_timeout=20, look_for_keys=False,
-              allow_agent=False)
-    return c
+    cli = paramiko.SSHClient()
+    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    cli.connect(
+        HOST,
+        username=USER,
+        password=os.environ["ROUTER_PASS"],
+        look_for_keys=False,
+        allow_agent=False,
+        timeout=15,
+    )
+    return cli
 
 
-def run(c, cmd, timeout=180):
-    _, so, se = c.exec_command(cmd, timeout=timeout)
-    out = so.read().decode("utf-8", "replace")
-    err = se.read().decode("utf-8", "replace")
-    rc = so.channel.recv_exit_status()
-    return rc, out, err
+def put(cli, local, remote):
+    data = open(local, "rb").read()
+    chan = cli.exec_command("cat > %s" % remote, timeout=90)
+    stdin = chan[0]
+    stdin.write(data)
+    stdin.channel.shutdown_write()
+    chan[1].read()
+    chan[2].read()
 
 
 def main():
-    c = connect()
-    try:
-        if sys.argv[1] == "put":
-            with open(sys.argv[2], "rb") as fh:
-                data = fh.read()
-            remote = sys.argv[3]
-            si, so, se = c.exec_command("cat > %s" % remote, timeout=60)
-            si.write(data)
-            si.channel.shutdown_write()
-            si.close()
-            out = so.read().decode("utf-8", "replace")
-            err = se.read().decode("utf-8", "replace")
-            rc = so.channel.recv_exit_status()
-            print("uploaded %d bytes rc=%d %s %s" % (len(data), rc, out.strip(), err.strip()))
+    args = sys.argv[1:]
+    script = args[0] if args else None
+    cli = connect()
+    i = 1
+    while i < len(args):
+        if args[i] == "--put":
+            local, remote = args[i + 1].split(":", 1)
+            put(cli, local, remote)
+            i += 2
         else:
-            rc, out, err = run(c, sys.argv[2])
-            sys.stdout.write(out)
-            if err.strip():
-                sys.stderr.write("\n[stderr]\n" + err)
-            print("\n[rc=%d]" % rc)
-    finally:
-        c.close()
+            i += 1
+    if script:
+        body = open(script, "rb").read()
+        sin, sout, serr = cli.exec_command("sh -s", timeout=180)
+        sin.write(body)
+        sin.channel.shutdown_write()
+        print(sout.read().decode(errors="replace"))
+        sys.stderr.write(serr.read().decode(errors="replace"))
+    cli.close()
 
 
 if __name__ == "__main__":

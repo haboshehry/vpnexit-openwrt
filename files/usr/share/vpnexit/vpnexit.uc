@@ -539,9 +539,16 @@ function table_exists(spec) {
 function routing_ruleset(vip, lan, wan, gw, server_ip, block_v6) {
 	let mark = cfg("mark", "0x1a1");
 	let mtu = cfg_int("tunnel_mtu", 1400);
-	let mss = mtu - 40;
+	// IKEv2/UDP + ESP adds about 80 bytes on this path. 1400 therefore leaves
+	// 1320 for TCP, while 1360 previously caused black-holed fragments on the
+	// Starlink/ISP path. Clamp conservatively; users can raise tunnel_mtu later.
+	let mss = mtu - 80;
+	if (mss < 1200) mss = 1200;
 	let lan_cidr = mask4(iface_cidr(lan)) ?? "192.168.1.0/24";
 	let wan_cidr = mask4(iface_cidr(wan)) ?? "";
+	// DNS is intentionally sent through the tunnel. This prevents the ISP/WAN
+	// resolver from leaking the query and avoids filtered domains returning an
+	// incomplete or blocked answer.
 	let excl = ["127.0.0.0/8", "224.0.0.0/4", "255.255.255.255/32", lan_cidr, vip + "/32"];
 	if (length(wan_cidr)) push(excl, wan_cidr);
 	if (length(server_ip)) push(excl, server_ip + "/32");
@@ -563,6 +570,11 @@ function routing_ruleset(vip, lan, wan, gw, server_ip, block_v6) {
 	push(t, "\tchain vpx_mss {");
 	push(t, "\t\ttype filter hook postrouting priority mangle; policy accept;");
 	push(t, sprintf("\t\tmeta mark %s tcp flags syn tcp option maxseg size set %d", mark, mss));
+	push(t, "\t}");
+	push(t, "\tchain vpx_dnsout {");
+	push(t, "\t\ttype route hook output priority mangle; policy accept;");
+	push(t, sprintf("\t\tudp dport 53 meta mark set %s counter", mark));
+	push(t, sprintf("\t\ttcp dport 53 meta mark set %s counter", mark));
 	push(t, "\t}");
 	if (block_v6) {
 		push(t, "\tchain vpx_v6 {");
@@ -808,16 +820,43 @@ function disconnect_impl() {
 
 function lock_acquire() {
 	let dir = RUN + "/lock";
-	for (let i = 0; i < 40; i++) {
+	for (let i = 0; i < 20; i++) {
 		if (run("mkdir " + shellq(dir) + " 2>/dev/null").rc == 0) return true;
-		let st = fs.stat(dir);
-		if (st && (now() - st.mtime) > 180) { run("rmdir " + shellq(dir) + " 2>/dev/null"); continue; }
-		sleep(500);
+		// Never wait for a lock whose owner is gone: the web server kills long
+		// running requests, which used to leave the directory behind and every
+		// later connect answered "busy" until the stale timeout expired.
+		if (!worker_alive()) { run("rm -rf " + shellq(dir)); continue; }
+		sleep(300);
 	}
 	return false;
 }
 
-function lock_release() { run("rmdir " + shellq(RUN + "/lock") + " 2>/dev/null"); }
+function lock_release() { run("rm -rf " + shellq(RUN + "/lock")); }
+
+// The worker PID is stored by the API process ($$ of the spawned shell), so a
+// simple SIG 0 test tells us whether an operation is really still running.
+function worker_alive() {
+	if (!fs.stat(RUN + "/lock")) return false;
+	let pid = intval(trim(readfile(RUN + "/lock/pid")), 0);
+	if (pid <= 0) return false;
+	return run(sprintf("kill -0 %d 2>/dev/null", pid)).rc == 0;
+}
+
+// Connecting can take longer than uhttpd's script timeout, so the API hands the
+// work to a detached worker and answers immediately; the panel already polls
+// /status, which is where the result shows up.
+function start_worker(key, idx) {
+	run("rm -rf " + shellq(RUN + "/lock"));
+	run("mkdir -p " + shellq(RUN + "/lock"));
+	state_patch({ state: "connecting", key: key, index: idx, error: "", checked_at: now() });
+	let cmd = sprintf("setsid %s %s job-connect %s %d >/dev/null 2>&1 & echo $!",
+		"/usr/bin/ucode", "/usr/share/vpnexit/vpnexit.uc", shellq(key), idx);
+	let r = run(cmd);
+	let pid = intval(trim(r.out), 0);
+	if (pid <= 0) return false;
+	fs.writefile(RUN + "/lock/pid", "" + pid);
+	return true;
+}
 
 function do_connect(key, index, verify) {
 	if (!lock_acquire()) return { ok: false, error: "busy: another operation is running" };
@@ -879,8 +918,9 @@ function supervise_once() {
 		let vip = length(s.vip) ? s.vip : (st.vip ?? "");
 		let patch = { state: "connected", vip: vip, uptime: s.uptime, rx: s.rx, tx: s.tx, checked_at: now(), attempts: 0 };
 		if (cfg_bool("share_lan", true) && length(vip) && !routing_active(vip)) {
-			let rr = routing_apply(vip);
-			patch.routing_ok = rr.ok;
+		let rr = routing_apply(vip);
+		patch.routing_ok = rr.ok;
+		if (!rr.ok) log("watchdog: routing restore failed: " + (rr.error ?? "unknown"));
 			if (rr.ok) log("watchdog: routing rules restored");
 		}
 		state_patch(patch);
@@ -1038,8 +1078,13 @@ function api() {
 		let b = jbody();
 		let key = trim("" + (b.key ?? ""));
 		if (!length(key)) { respond({ ok: false, error: "missing key" }); return; }
-		let r = do_connect(key, intval(b.index, 0), true);
-		respond(r);
+		let loc = find_location(key);
+		if (loc == null) { respond({ ok: false, error: "unknown location " + key }); return; }
+		let idx = intval(b.index, 0);
+		if (idx < 0 || idx >= length(loc.servers)) idx = 0;
+		if (worker_alive()) { respond({ ok: false, error: "busy: a connection attempt is already running" }); return; }
+		if (!start_worker(key, idx)) { respond({ ok: false, error: "cannot start the connect worker" }); return; }
+		respond({ ok: true, async: true, key: key, index: idx, state: "connecting" });
 		return;
 	}
 	if (path == "disconnect" && method == "POST") { respond(do_disconnect()); return; }
@@ -1087,6 +1132,18 @@ function main() {
 		let key = argv[1] ?? "";
 		if (!length(key)) { print("usage: vpnexit connect <key> [index]\n"); return; }
 		print(sprintf("%J", do_connect(key, intval(argv[2], 0), true)) + "\n");
+		return;
+	}
+	if (cmd == "job-connect") {
+		// Detached worker started by the panel: owns the lock until it is done.
+		let key = argv[1] ?? "";
+		let idx = intval(argv[2], 0);
+		let r = { ok: false, error: "no key" };
+		if (length(key)) {
+			try { r = connect_impl(key, idx, true); }
+			catch (e) { r = { ok: false, error: "" + e }; }
+		}
+		lock_release();
 		return;
 	}
 	if (cmd == "disconnect") { print(sprintf("%J", do_disconnect()) + "\n"); return; }

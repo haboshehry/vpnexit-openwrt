@@ -41,7 +41,9 @@
       confirmDisc: "Disconnect the tunnel and stop sharing it with the LAN?",
       updating: "Working…",
       source: "Backend source", openRaw: "Open raw", close: "Close",
-      srcHint: "This file lives outside the web root and has no direct URL."
+      srcHint: "This file lives outside the web root and has no direct URL.",
+      chooseServer: "Choose server", pickServer: "Pick the server to connect to.",
+      busy: "Another operation is still running, try again in a moment."
     },
     fa: {
       dir: "rtl",
@@ -77,7 +79,9 @@
       confirmDisc: "تونل قطع و اشتراک‌گذاری با LAN متوقف شود؟",
       updating: "در حال انجام…",
       source: "سورس بک‌اند", openRaw: "نمایش خام", close: "بستن",
-      srcHint: "این فایل خارج از ریشهٔ وب است و آدرس مستقیم ندارد."
+      srcHint: "این فایل خارج از ریشهٔ وب است و آدرس مستقیم ندارد.",
+      chooseServer: "انتخاب سرور", pickServer: "سروری را که می‌خواهید به آن وصل شوید انتخاب کنید.",
+      busy: "یک عملیات دیگر در حال اجراست؛ چند لحظه بعد دوباره تلاش کنید."
     }
   };
 
@@ -279,7 +283,9 @@
       btn.textContent = isActive ? t("disconnectShort") : t("connectShort");
       btn.disabled = state.busy;
       btn.addEventListener("click", function () {
-        if (isActive) disconnect(); else connect(it.key, 0, btn);
+        if (isActive) { disconnect(); return; }
+        if ((it.servers || []).length > 1) openServerPicker(it);
+        else connect(it.key, 0, btn);
       });
       row.appendChild(btn);
       frag.appendChild(row);
@@ -341,9 +347,14 @@
     renderStatus();
     api("connect", { body: { key: key, index: index || 0 } }).then(function (r) {
       setBusy(false);
-      if (r.ok) { toast(t("toastConnected"), "ok"); }
-      else if (!r.unauthorized) { toast(r.error || t("toastError"), "err"); }
-      return loadStatus();
+      if (r.ok) {
+        toast(t("connecting"), "ok");
+        setTimeout(function () { loadStatus(); }, 800);
+      } else if (!r.unauthorized) {
+        toast((r.error || "").indexOf("busy") === 0 ? t("busy") : (r.error || t("toastError")), "err");
+        loadStatus();
+      }
+      return null;
     }).then(function () { if (state.locations) renderLocations(); });
   }
 
@@ -407,6 +418,31 @@
     });
   }
 
+  function openServerPicker(loc) {
+    $("srvTitle").textContent = (loc.flag ? loc.flag + " " : "") + (loc.title || loc.key);
+    $("srvHint").textContent = t("servers", (loc.servers || []).length) + " — " + t("pickServer");
+    var box = $("srvList");
+    box.innerHTML = "";
+    (loc.servers || []).forEach(function (s, i) {
+      var row = document.createElement("div");
+      row.className = "loc-row";
+      row.innerHTML =
+        '<div class="loc-flag" style="font-size:13px;font-weight:700">' + (i + 1) + "</div>" +
+        '<div class="loc-info"><div class="loc-name">' + esc(s.host) + "</div>" +
+        '<div class="loc-meta">' + esc(s.ip || "") + "</div></div>";
+      var b = document.createElement("button");
+      b.className = "btn sm btn-primary";
+      b.textContent = t("connectShort");
+      b.addEventListener("click", function () {
+        $("serverModal").hidden = true;
+        connect(loc.key, i, null);
+      });
+      row.appendChild(b);
+      box.appendChild(row);
+    });
+    $("serverModal").hidden = false;
+  }
+
   function openSource() {
     $("sourceModal").hidden = false;
     $("srcCode").textContent = "…";
@@ -467,6 +503,10 @@
     $("panicBtn").addEventListener("click", function () { $("drawer").hidden = true; disconnect(); });
     $("logToggle").addEventListener("click", function () { toggleLog(); });
     $("sourceBtn").addEventListener("click", openSource);
+    $("srvClose").addEventListener("click", function () { $("serverModal").hidden = true; });
+    $("serverModal").addEventListener("click", function (e) {
+      if (e.target === $("serverModal")) $("serverModal").hidden = true;
+    });
     $("srcClose").addEventListener("click", function () { $("sourceModal").hidden = true; });
     $("srcCloseBtn").addEventListener("click", function () { $("sourceModal").hidden = true; });
     $("sourceModal").addEventListener("click", function (e) {
