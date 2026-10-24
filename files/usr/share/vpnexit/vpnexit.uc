@@ -372,15 +372,55 @@ function find_location(key) {
 
 // -------------------------------------------------------------- feed access
 
+function url_host(url) {
+	let m = match(url ?? "", /^https?:\/\/([^\/:]+)/);
+	return m ? m[1] : "";
+}
+
+function resolve4(host) {
+	let r = run("nslookup " + shellq(host));
+	let out = [];
+	for (let line in split(r.out, "\n")) {
+		let m = match(line, /Address:\s*([0-9.]+)/);
+		if (!m) continue;
+		if (index(out, m[1]) < 0) push(out, m[1]);
+		if (length(out) >= 4) break;
+	}
+	return out;
+}
+
+// Some ISPs answer a TLS reset for the feed host. When the tunnel is up the same
+// request succeeds through it, so the marked path is used as a fallback.
+function fetch_via_tunnel(url, outfile) {
+	let host = url_host(url);
+	if (!length(host)) return { rc: -1, out: "bad url" };
+	let ips = resolve4(host);
+	if (!length(ips)) return { rc: -1, out: "cannot resolve " + host };
+	let mark = cfg("mark", "0x1a1");
+	run("nft delete table inet vxprobe");
+	run("nft add table inet vxprobe");
+	run("nft add chain inet vxprobe out '{ type route hook output priority mangle; policy accept; }'");
+	for (let ip in ips)
+		run(sprintf("nft add rule inet vxprobe out ip daddr %s meta mark set %s", ip, mark));
+	let r = run(sprintf("uclient-fetch -q -O %s --timeout=30 %s", shellq(outfile), shellq(url)));
+	run("nft delete table inet vxprobe");
+	log(sprintf("refresh: tried %d address(es) through the tunnel, rc=%d", length(ips), r.rc));
+	return r;
+}
+
 function refresh() {
 	let url = cfg("feed_url", "");
 	if (!length(url)) return { ok: false, error: "no feed url configured" };
 	ensure_dir(RUN);
 	let tmp = RUN + "/feed.json";
 	let r = run(sprintf("uclient-fetch -q -O %s --timeout=25 %s", shellq(tmp), shellq(url)));
+	if (r.rc != 0 && state_read().state == "connected") {
+		log(sprintf("refresh: direct fetch failed (%d), retrying through the tunnel", r.rc));
+		r = fetch_via_tunnel(url, tmp);
+	}
 	if (r.rc != 0) {
 		log(sprintf("refresh: fetch failed (%d) %s", r.rc, trim(r.out)));
-		return { ok: false, error: "feed download failed" };
+		return { ok: false, error: "feed download failed: " + trim(r.out) };
 	}
 	let body = readfile(tmp);
 	fs.unlink(tmp);

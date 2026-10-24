@@ -18,8 +18,8 @@
       partialSub: "Tunnel is up, but LAN sharing is off.",
       connect: "Connect", disconnect: "Disconnect", reconnect: "Reconnect", selftest: "Self-test",
       exitIp: "Exit IP", tunnelIp: "Tunnel IP", uptime: "Uptime", traffic: "Traffic",
-      locations: "Locations", search: "Search country…", refresh: "Refresh",
-      refreshing: "Refreshing…", premium: "premium", servers: "{0} server(s)",
+      locations: "Locations", search: "Search country…", refresh: "Update list",
+      refreshing: "Updating…", premium: "premium", servers: "{0} server(s)",
       connectShort: "Connect", disconnectShort: "Disconnect",
       empty: "No locations yet. Press Refresh to download the feed.",
       emptyFilter: "Nothing matches your search.",
@@ -56,8 +56,8 @@
       partialSub: "تونل برقرار است اما اشتراک‌گذاری با LAN خاموش است.",
       connect: "اتصال", disconnect: "قطع", reconnect: "اتصال مجدد", selftest: "تست خودکار",
       exitIp: "IP خروجی", tunnelIp: "IP تونل", uptime: "مدت اتصال", traffic: "ترافیک",
-      locations: "موقعیت‌ها", search: "جستجوی کشور…", refresh: "به‌روزرسانی",
-      refreshing: "در حال دریافت…", premium: "ویژه", servers: "{0} سرور",
+      locations: "موقعیت‌ها", search: "جستجوی کشور…", refresh: "به‌روزرسانی لیست",
+      refreshing: "در حال به‌روزرسانی…", premium: "ویژه", servers: "{0} سرور",
       connectShort: "اتصال", disconnectShort: "قطع",
       empty: "فهرستی موجود نیست. دکمه به‌روزرسانی را بزنید.",
       emptyFilter: "موردی با این جستجو پیدا نشد.",
@@ -382,14 +382,31 @@
     });
   }
 
-  function refreshFeed() {
-    if (state.busy) return;
-    $("refreshLabel").textContent = t("refreshing");
-    api("refresh", { body: {} }).then(function (r) {
-      $("refreshLabel").textContent = t("refresh");
-      if (r.ok) { toast(t("toastRefreshed") + " (" + (r.count || 0) + ")", "ok"); return loadLocations(false); }
-      if (!r.unauthorized) toast(r.error || t("toastError"), "err");
+  function setRefreshing(on) {
+    ["refreshBtn", "refreshTop"].forEach(function (id) {
+      var el = $(id);
+      if (el) el.disabled = on;
     });
+    var icons = document.querySelectorAll("#refreshIcon, #refreshTop svg");
+    Array.prototype.forEach.call(icons, function (i) {
+      i.classList.toggle("spin-icon", on);
+    });
+    $("refreshLabel").textContent = on ? t("refreshing") : t("refresh");
+  }
+
+  // Manual feed refresh: downloads the JSON again and re-renders the list.
+  function refreshFeed() {
+    if (state.busy) { toast(t("busy"), "err"); return; }
+    setRefreshing(true);
+    api("refresh", { body: {} }).then(function (r) {
+      setRefreshing(false);
+      if (r.ok) {
+        toast(t("toastRefreshed") + " (" + (r.count || 0) + ")", "ok");
+        return loadLocations(false);
+      }
+      if (!r.unauthorized) toast(r.error || t("toastError"), "err");
+      return null;
+    }).catch(function () { setRefreshing(false); });
   }
 
   function openGate() {
@@ -491,6 +508,7 @@
 
     $("testBtn").addEventListener("click", selftest);
     $("refreshBtn").addEventListener("click", refreshFeed);
+    $("refreshTop").addEventListener("click", refreshFeed);
     $("search").addEventListener("input", function (e) { state.filter = e.target.value; renderLocations(); });
     $("settingsBtn").addEventListener("click", function () { $("setErr").hidden = true; $("drawer").hidden = false; loadSettings(); });
     $("drawerClose").addEventListener("click", function () { $("drawer").hidden = true; });
