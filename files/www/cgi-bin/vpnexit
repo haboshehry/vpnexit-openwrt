@@ -1,0 +1,4 @@
+#!/bin/sh
+# CGI entry point: /cgi-bin/vpnexit/api/<endpoint>
+# uhttpd passes the request body on stdin and the path in PATH_INFO.
+exec /usr/bin/ucode /usr/share/vpnexit/vpnexit.uc api

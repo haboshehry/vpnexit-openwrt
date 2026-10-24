@@ -1,0 +1,13 @@
+*.tar.gz
+*.tgz
+*.ipk
+*.apk
+.build/
+.recon/
+state.json
+locations.json
+last.nft
+apply.nft
+log
+.DS_Store
+Thumbs.db

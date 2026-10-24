@@ -1,0 +1,3 @@
+#!/bin/sh
+# vpnexit CLI - thin wrapper around the ucode implementation.
+exec /usr/bin/ucode /usr/share/vpnexit/vpnexit.uc "$@"
