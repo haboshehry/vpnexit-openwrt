@@ -1,0 +1,14 @@
+[Unit]
+Description=vpnexit panel (LAN exit switcher)
+After=network-online.target strongswan-swanctl.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/vpnexit serve 8088
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

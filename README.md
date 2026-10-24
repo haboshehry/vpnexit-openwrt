@@ -172,3 +172,29 @@ http://192.168.1.1/vpnexit/source.txt               # static, read-only copy
 ```
 
   or the `</>` button in the panel header.
+## Install on Debian / Ubuntu / Raspberry Pi / RaspAP
+
+The `portable/` folder contains a Python 3 build (no ucode) that serves the same
+panel and API on port 8088 and runs as two systemd services.
+
+```sh
+git clone <repo> /tmp/vpnexit
+cd /tmp/vpnexit && sh portable/install-debian.sh
+```n
+It installs strongswan-swanctl, nftables, curl, sshpass, python3; writes
+`/etc/vpnexit/config.json`; splits the system CA store for the pem plugin; enables
+IP forwarding; and prints the panel URL plus the admin token.
+
+On a **RaspAP** host set `lan_iface` to the AP interface (usually `wlan0`) if
+wireless clients are not redirected:
+
+```sh
+python3 - <<'PY'
+import json
+p='/etc/vpnexit/config.json'
+c=json.load(open(p)); c['lan_iface']='wlan0'; json.dump(c,open(p,'w'),indent=1)
+PY
+systemctl restart vpnexit-supervisor
+```n
+Services: `vpnexit-web` (panel), `vpnexit-supervisor` (watchdog + daily feed).
+Logs: `journalctl -u vpnexit-supervisor -f`.

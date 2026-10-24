@@ -1,0 +1,14 @@
+[Unit]
+Description=vpnexit supervisor (tunnel watchdog and daily feed refresh)
+After=network-online.target strongswan-swanctl.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/vpnexit supervise
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
