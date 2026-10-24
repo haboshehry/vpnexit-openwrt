@@ -47,6 +47,14 @@ cp -a "$SRC/files/." /
 chmod 0755 /usr/sbin/vpnexit /etc/init.d/vpnexit /www/cgi-bin/vpnexit 2>/dev/null || true
 chmod 0644 /www/vpnexit/* /usr/share/vpnexit/* 2>/dev/null || true
 
+# The backend lives outside the web root, so expose a read-only copy that can be
+# opened directly from a browser.
+cp /usr/share/vpnexit/vpnexit.uc /www/vpnexit/source.txt
+chmod 0644 /www/vpnexit/source.txt
+
+# LuCI caches the menu tree; drop it so "Services -> VPN Exit" shows up at once.
+rm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null || true
+
 # ------------------------------------------------------------------- 3. ca
 # strongSwan's pem plugin reads one certificate per file, so the system bundle
 # is split once. Chains learned per server are added later by the app.

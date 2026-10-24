@@ -124,13 +124,20 @@ sh /tmp/vpnexit-openwrt/uninstall.sh
 Keeps `/etc/config/vpnexit`; pass `--purge` to remove the configuration and the
 profile cache as well.
 
-## Backend source
+## Where to click
 
-`/usr/share/vpnexit/vpnexit.uc` sits outside the web root, so it cannot be
-opened directly on the router (a direct path always returns 404). Use the
-`</>` button in the panel header, or the authenticated endpoint:
+* **LuCI top bar** — a `VPN Exit` entry is added next to Status / System /
+  Network (`admin/vpnexit`) and also under *Services*. It opens the panel
+  inside LuCI, with a "open in a new tab" button.
+* **Panel** — `http://192.168.1.1/vpnexit/` (works on the HTTPS listener too).
+* **Backend source** — `/usr/share/vpnexit/vpnexit.uc` is outside the web
+  root, so a path such as `/files/usr/share/vpnexit/vpnexit.uc` can never work
+  (uhttpd has no such route). Use one of:
 
 ```
-/cgi-bin/vpnexit/api/source?t=TOKEN          # JSON {path, bytes, text}
-/cgi-bin/vpnexit/api/source?raw=1&t=TOKEN    # text/plain
+http://192.168.1.1/vpnexit/source.txt               # static, read-only copy
+/cgi-bin/vpnexit/api/source?t=TOKEN                 # JSON {path, bytes, text}
+/cgi-bin/vpnexit/api/source?raw=1&t=TOKEN           # text/plain
 ```
+
+  or the `</>` button in the panel header.

@@ -38,6 +38,9 @@ rm -f /usr/sbin/vpnexit \
       /etc/swanctl/conf.d/vpnexit-secrets.conf
 rm -rf /usr/share/vpnexit /www/vpnexit /var/run/vpnexit
 rm -f /etc/swanctl/x509ca/vpnx-*.pem
+rm -f /usr/share/luci/menu.d/luci-app-vpnexit.json
+rm -rf /www/luci-static/resources/view/vpnexit
+rm -rf /tmp/luci-indexcache /tmp/luci-modulecache
 
 if [ "$PURGE" = "1" ]; then
 	echo "==> removing configuration and cached profiles"

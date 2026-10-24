@@ -1,0 +1,18 @@
+{
+	"admin/vpnexit": {
+		"title": "VPN Exit",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "vpnexit/overview"
+		}
+	},
+	"admin/services/vpnexit": {
+		"title": "VPN Exit",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "vpnexit/overview"
+		}
+	}
+}
