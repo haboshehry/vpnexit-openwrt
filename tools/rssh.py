@@ -39,16 +39,19 @@ def put(cli, local, remote):
 
 def main():
     args = sys.argv[1:]
-    script = args[0] if args else None
-    cli = connect()
-    i = 1
+    script = None
+    puts = []
+    i = 0
     while i < len(args):
         if args[i] == "--put":
-            local, remote = args[i + 1].split(":", 1)
-            put(cli, local, remote)
+            puts.append(tuple(args[i + 1].split(":", 1)))
             i += 2
         else:
+            script = args[i]
             i += 1
+    cli = connect()
+    for local, remote in puts:
+        put(cli, local, remote)
     if script:
         body = open(script, "rb").read()
         sin, sout, serr = cli.exec_command("sh -s", timeout=180)

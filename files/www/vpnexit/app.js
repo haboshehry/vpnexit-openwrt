@@ -43,7 +43,7 @@
       source: "Backend source", openRaw: "Open raw", close: "Close",
       srcHint: "This file lives outside the web root and has no direct URL.",
       chooseServer: "Choose server", pickServer: "Pick the server to connect to.",
-      busy: "Another operation is still running, try again in a moment."
+      serverN: "Server {0}", busy: "Another operation is still running, try again in a moment."
     },
     fa: {
       dir: "rtl",
@@ -81,7 +81,7 @@
       source: "سورس بک‌اند", openRaw: "نمایش خام", close: "بستن",
       srcHint: "این فایل خارج از ریشهٔ وب است و آدرس مستقیم ندارد.",
       chooseServer: "انتخاب سرور", pickServer: "سروری را که می‌خواهید به آن وصل شوید انتخاب کنید.",
-      busy: "یک عملیات دیگر در حال اجراست؛ چند لحظه بعد دوباره تلاش کنید."
+      serverN: "سرور {0}", busy: "یک عملیات دیگر در حال اجراست؛ چند لحظه بعد دوباره تلاش کنید."
     }
   };
 
@@ -262,33 +262,34 @@
     }
 
     var activeKey = state.status && state.status.location && state.status.location.key;
+    var activeIndex = state.status && state.status.server ? Number(state.status.server.index || 0) : -1;
     var frag = document.createDocumentFragment();
     items.forEach(function (it) {
-      var row = document.createElement("div");
-      row.className = "loc-row" + (it.key === activeKey ? " active" : "");
-      row.setAttribute("role", "listitem");
-      var n = (it.servers || []).length;
-      row.innerHTML =
-        '<div class="loc-flag">' + esc(it.flag || "🌐") + "</div>" +
-        '<div class="loc-info">' +
-          '<div class="loc-name">' + esc(it.title || it.key) +
-            (it.premium ? ' <span class="pill">' + esc(t("premium")) + "</span>" : "") +
-            (it.key === activeKey ? ' <span class="dot"></span>' : "") +
-          "</div>" +
-          '<div class="loc-meta">' + esc((it.country || "") + " · " + (it.servers && it.servers[0] ? it.servers[0].host : "")) + " · " + esc(t("servers", n)) + "</div>" +
-        "</div>";
-      var btn = document.createElement("button");
-      var isActive = it.key === activeKey && state.status.state === "connected";
-      btn.className = "btn sm " + (isActive ? "btn-danger" : "btn-ghost");
-      btn.textContent = isActive ? t("disconnectShort") : t("connectShort");
-      btn.disabled = state.busy;
-      btn.addEventListener("click", function () {
-        if (isActive) { disconnect(); return; }
-        if ((it.servers || []).length > 1) openServerPicker(it);
-        else connect(it.key, 0, btn);
+      (it.servers || []).forEach(function (srv, serverIndex) {
+        var row = document.createElement("div");
+        var isActive = it.key === activeKey && serverIndex === activeIndex && state.status.state === "connected";
+        row.className = "loc-row" + (isActive ? " active" : "");
+        row.setAttribute("role", "listitem");
+        row.innerHTML =
+          '<div class="loc-flag">' + esc(it.flag || "🌐") + "</div>" +
+          '<div class="loc-info">' +
+            '<div class="loc-name">' + esc(it.title || it.key) +
+              ' <span class="pill">' + esc(t("serverN", serverIndex + 1)) + "</span>" +
+              (it.premium ? ' <span class="pill">' + esc(t("premium")) + "</span>" : "") +
+              (isActive ? ' <span class="dot"></span>' : "") +
+            "</div>" +
+            '<div class="loc-meta">' + esc((it.country || "") + " · " + (srv.host || "") + (srv.ip ? " · " + srv.ip : "")) + "</div>" +
+          "</div>";
+        var btn = document.createElement("button");
+        btn.className = "btn sm " + (isActive ? "btn-danger" : "btn-ghost");
+        btn.textContent = isActive ? t("disconnectShort") : t("connectShort");
+        btn.disabled = state.busy;
+        btn.addEventListener("click", function () {
+          if (isActive) disconnect(); else connect(it.key, serverIndex, btn);
+        });
+        row.appendChild(btn);
+        frag.appendChild(row);
       });
-      row.appendChild(btn);
-      frag.appendChild(row);
     });
     box.appendChild(frag);
 
