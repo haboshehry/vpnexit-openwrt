@@ -79,7 +79,18 @@ if [ ! -d /etc/swanctl/x509ca ] || [ "$(ls /etc/swanctl/x509ca 2>/dev/null | wc 
 fi
 
 # ------------------------------------------------------- 4. charon drop-in
-cat > /etc/strongswan.d/vpnexit.conf <<'EOF'
+# SoftEther (and a few other VPN daemons) bind UDP 500/4500 on the router. In
+# that case charon moves to 15000/14500; peers accept IKE from a non-standard
+# source port, so no NAT helper is required.
+IKE_PORT=500
+NATT_PORT=4500
+if netstat -lnup 2>/dev/null | awk '$4 ~ /:500$/ {print $NF}' | grep -qv charon; then
+	IKE_PORT=15000
+	NATT_PORT=14500
+	echo "    UDP 500 is taken, charon will use ${IKE_PORT}/${NATT_PORT}"
+fi
+
+cat > /etc/strongswan.d/vpnexit.conf <<EOF
 # Managed by vpnexit - do not edit.
 #
 # Routes are installed by vpnexit (marked LAN traffic -> table 417); charon must
@@ -94,8 +105,8 @@ cat > /etc/strongswan.d/vpnexit.conf <<'EOF'
 charon {
 	install_routes = no
 	install_virtual_ip = no
-	port = 500
-	port_nat_t = 4500
+	port = $IKE_PORT
+	port_nat_t = $NATT_PORT
 	plugins {
 		kernel-libipsec { load = no }
 		farp { load = no }
