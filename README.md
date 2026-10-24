@@ -51,6 +51,25 @@ vpnexit selftest
 vpnexit disconnect
 ```
 
+## Profile feed: fallback chain
+
+A failed download never leaves the panel without a list. The order is:
+
+1. **direct** — the router's own uplink
+2. **through the tunnel** — the request is marked and leaves via the VPN exit
+3. **through a relay** — an SSH host that can reach the feed, which downloads
+   it and pipes the body back
+
+```sh
+uci set vpnexit.main.relay_enabled='1'
+uci set vpnexit.main.relay_list='root@203.0.113.10:22,root@198.51.100.5:2020'
+uci set vpnexit.main.relay_pass='…'      # used by sshpass, file is mode 600
+uci commit vpnexit
+vpnexit relay-test                        # {"rc":0,"note":"relay …","bytes":16277}
+```
+
+Each relay is tried in order; the body must parse as JSON before it is accepted.
+
 ## Settings (`/etc/config/vpnexit`)
 
 | option | default | meaning |

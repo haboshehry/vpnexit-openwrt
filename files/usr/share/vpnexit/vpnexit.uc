@@ -408,6 +408,43 @@ function fetch_via_tunnel(url, outfile) {
 	return r;
 }
 
+// Last resort: fetch the feed on a remote host that is reachable from the
+// router but not behind the same ISP filtering, then pull the body over SSH.
+// relay_list is "user@host:port,user@host:port"; relay_pass is used by sshpass.
+function relay_fetch(url, outfile) {
+	let pass = cfg("relay_pass", "");
+	let list = cfg("relay_list", "");
+	if (!length(pass) || !length(list)) return { rc: -1, out: "no relay configured" };
+	for (let item in split(list, ",")) {
+		item = trim(item);
+		if (!length(item)) continue;
+		// Parsed by hand: ucode's regex engine has no non-capturing groups.
+		let user = "root", host = item, port = 22;
+		let at = index(host, "@");
+		if (at > 0) { user = substr(host, 0, at); host = substr(host, at + 1); }
+		let colon = rindex(host, ":");
+		if (colon > 0) { port = intval(substr(host, colon + 1), 22); host = substr(host, 0, colon); }
+		if (!length(host)) continue;
+		log(sprintf("refresh: trying relay %s:%d", host, port));
+		let remote = sprintf("curl -fsS --max-time 30 %s", shellq(url));
+		let inner = sprintf(
+			"sshpass -p %s ssh -p %d -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o PreferredAuthentications=password -o PubkeyAuthentication=no %s@%s %s > %s",
+			shellq(pass), port, shellq(user), shellq(host), shellq(remote), shellq(outfile));
+		let r = run("sh -c " + shellq(inner));
+		if (r.rc != 0) continue;
+		let body = readfile(outfile);
+		if (length(body) < 200) continue;
+		try {
+			let d = json(body);
+			if (type(d) == "object" && d != null) {
+				log(sprintf("refresh: fetched through relay %s (%d bytes)", host, length(body)));
+				return { rc: 0, out: "relay " + host };
+			}
+		} catch (e) { }
+	}
+	return { rc: -1, out: "all relays failed" };
+}
+
 function refresh() {
 	let url = cfg("feed_url", "");
 	if (!length(url)) return { ok: false, error: "no feed url configured" };
@@ -417,6 +454,10 @@ function refresh() {
 	if (r.rc != 0 && state_read().state == "connected") {
 		log(sprintf("refresh: direct fetch failed (%d), retrying through the tunnel", r.rc));
 		r = fetch_via_tunnel(url, tmp);
+	}
+	if (r.rc != 0) {
+		log("refresh: tunnel path failed, trying the relay servers");
+		r = relay_fetch(url, tmp);
 	}
 	if (r.rc != 0) {
 		log(sprintf("refresh: fetch failed (%d) %s", r.rc, trim(r.out)));
@@ -1188,6 +1229,12 @@ function main() {
 	if (cmd == "api") { api(); return; }
 	if (cmd == "supervise") { supervise(); return; }
 	if (cmd == "refresh") { print(sprintf("%J", refresh()) + "\n"); return; }
+	if (cmd == "relay-test") {
+		let out = RUN + "/relay.json";
+		let r = relay_fetch(cfg("feed_url", ""), out);
+		print(sprintf("%J", { rc: r.rc, note: r.out, bytes: length(readfile(out)) }) + "\n");
+		return;
+	}
 	if (cmd == "status") {
 		let st = state_read();
 		let s = sas_parse();

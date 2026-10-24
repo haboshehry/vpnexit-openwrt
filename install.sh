@@ -124,6 +124,11 @@ config vpnexit 'main'
 	option rule_priority '1000'
 	option watchdog_seconds '20'
 	option deadman_seconds '45'
+	# Update fallback chain: direct -> tunnel -> these SSH relays.
+	# Format: user@host:port,user@host:port  (relay_pass is used by sshpass)
+	option relay_enabled '0'
+	option relay_list ''
+	option relay_pass ''
 	option lan_iface ''
 	option brand 'VPN Exit'
 EOF
