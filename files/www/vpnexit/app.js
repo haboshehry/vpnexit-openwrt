@@ -39,7 +39,9 @@
       testOk: "Exit verified: {0}", testFail: "Self-test failed",
       foot: "vpnexit · router-side IKEv2 client",
       confirmDisc: "Disconnect the tunnel and stop sharing it with the LAN?",
-      updating: "Working…"
+      updating: "Working…",
+      source: "Backend source", openRaw: "Open raw", close: "Close",
+      srcHint: "This file lives outside the web root and has no direct URL."
     },
     fa: {
       dir: "rtl",
@@ -73,7 +75,9 @@
       testOk: "خروجی تأیید شد: {0}", testFail: "تست خودکار ناموفق بود",
       foot: "vpnexit · کلاینت IKEv2 روی روتر",
       confirmDisc: "تونل قطع و اشتراک‌گذاری با LAN متوقف شود؟",
-      updating: "در حال انجام…"
+      updating: "در حال انجام…",
+      source: "سورس بک‌اند", openRaw: "نمایش خام", close: "بستن",
+      srcHint: "این فایل خارج از ریشهٔ وب است و آدرس مستقیم ندارد."
     }
   };
 
@@ -164,7 +168,7 @@
     mtuT: "setMtuT", mtuD: "setMtuD", feedT: "setFeedT", feedD: "setFeedD",
     tokT: "setTokT", tokD: "setTokD", save: "saveSettings", gateTitle: "gateTitle",
     gateHint: "gateHint", unlock: "gateBtn", foot: "footNote", activity: "logTitle",
-    locations: "locTitle"
+    locations: "locTitle", source: "srcTitle", openRaw: "srcRaw", close: "srcCloseBtn"
   };
 
   function applyLang() {
@@ -403,6 +407,17 @@
     });
   }
 
+  function openSource() {
+    $("sourceModal").hidden = false;
+    $("srcCode").textContent = "…";
+    $("srcRaw").href = API + "source?raw=1&t=" + encodeURIComponent(state.token || "");
+    api("source").then(function (r) {
+      if (!r.ok) { $("srcCode").textContent = r.error || t("toastError"); return; }
+      $("srcPath").textContent = r.path + " · " + r.bytes + " B — " + t("srcHint");
+      $("srcCode").textContent = r.text;
+    });
+  }
+
   function toggleLog(show) {
     var box = $("logBox");
     var on = show == null ? box.hidden : show;
@@ -451,6 +466,12 @@
     });
     $("panicBtn").addEventListener("click", function () { $("drawer").hidden = true; disconnect(); });
     $("logToggle").addEventListener("click", function () { toggleLog(); });
+    $("sourceBtn").addEventListener("click", openSource);
+    $("srcClose").addEventListener("click", function () { $("sourceModal").hidden = true; });
+    $("srcCloseBtn").addEventListener("click", function () { $("sourceModal").hidden = true; });
+    $("sourceModal").addEventListener("click", function (e) {
+      if (e.target === $("sourceModal")) $("sourceModal").hidden = true;
+    });
 
     $("gateForm").addEventListener("submit", function (e) {
       e.preventDefault();

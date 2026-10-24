@@ -900,6 +900,20 @@ function api() {
 		return;
 	}
 
+	// The backend lives outside the web root, so it cannot be opened directly;
+	// this endpoint exposes it for inspection (and for `raw=1` downloads).
+	if (path == "source" && method == "GET") {
+		let file = "/usr/share/vpnexit/vpnexit.uc";
+		let text = readfile(file);
+		if (!length(text)) { respond({ ok: false, error: "source not found" }, 404); return; }
+		if (index(getenv("QUERY_STRING") ?? "", "raw=1") >= 0) {
+			print("Content-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\n\r\n");
+			print(text);
+			return;
+		}
+		respond({ ok: true, path: file, bytes: length(text), text: text });
+		return;
+	}
 	if (path == "status" && method == "GET") { respond({ ok: true, status: status_obj() }); return; }
 	if (path == "locations" && method == "GET") {
 		let q = getenv("QUERY_STRING") ?? "";

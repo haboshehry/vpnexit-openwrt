@@ -123,3 +123,14 @@ sh /tmp/vpnexit-openwrt/uninstall.sh
 
 Keeps `/etc/config/vpnexit`; pass `--purge` to remove the configuration and the
 profile cache as well.
+
+## Backend source
+
+`/usr/share/vpnexit/vpnexit.uc` sits outside the web root, so it cannot be
+opened directly on the router (a direct path always returns 404). Use the
+`</>` button in the panel header, or the authenticated endpoint:
+
+```
+/cgi-bin/vpnexit/api/source?t=TOKEN          # JSON {path, bytes, text}
+/cgi-bin/vpnexit/api/source?raw=1&t=TOKEN    # text/plain
+```
