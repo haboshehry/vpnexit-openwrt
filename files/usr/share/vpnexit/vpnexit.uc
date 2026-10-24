@@ -652,8 +652,14 @@ function routing_ruleset(vip, lan, wan, gw, server_ip, block_v6) {
 	push(t, "\t\ttype filter hook postrouting priority mangle; policy accept;");
 	push(t, sprintf("\t\tmeta mark %s tcp flags syn tcp option maxseg size set %d", mark, mss));
 	push(t, "\t}");
+	// DNS is tunneled to avoid ISP filtering, but only for public resolvers.
+	// The router's own upstream usually lives on the LAN (the ISP router), and
+	// marking those queries sent them into the tunnel where nothing answers,
+	// which broke DNS for LuCI diagnostics and for the router itself.
 	push(t, "\tchain vpx_dnsout {");
 	push(t, "\t\ttype route hook output priority mangle; policy accept;");
+	push(t, "\t\tudp dport 53 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 127.0.0.0/8 } return");
+	push(t, "\t\ttcp dport 53 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 127.0.0.0/8 } return");
 	push(t, sprintf("\t\tudp dport 53 meta mark set %s counter", mark));
 	push(t, sprintf("\t\ttcp dport 53 meta mark set %s counter", mark));
 	push(t, "\t}");
