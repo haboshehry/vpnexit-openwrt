@@ -554,25 +554,25 @@ function routing_ruleset(vip, lan, wan, gw, server_ip, block_v6) {
 	push(t, "\t\tauto-merge");
 	push(t, sprintf("\t\telements = { %s }", join(", ", excl)));
 	push(t, "\t}");
-	push(t, "\tchain mark {");
+	push(t, "\tchain vpx_mark {");
 	push(t, "\t\ttype filter hook prerouting priority mangle; policy accept;");
 	push(t, sprintf("\t\tiifname != \"%s\" return", lan));
 	push(t, "\t\tip daddr @exclude4 return");
 	push(t, sprintf("\t\tmeta mark set %s counter", mark));
 	push(t, "\t}");
-	push(t, "\tchain mss {");
+	push(t, "\tchain vpx_mss {");
 	push(t, "\t\ttype filter hook postrouting priority mangle; policy accept;");
 	push(t, sprintf("\t\tmeta mark %s tcp flags syn tcp option maxseg size set %d", mark, mss));
 	push(t, "\t}");
 	if (block_v6) {
-		push(t, "\tchain fwd6 {");
+		push(t, "\tchain vpx_v6 {");
 		push(t, "\t\ttype filter hook forward priority filter; policy accept;");
 		push(t, sprintf("\t\tiifname \"%s\" oifname \"%s\" meta nfproto ipv6 drop", lan, wan));
 		push(t, "\t}");
 	}
 	push(t, "}");
 	push(t, "table ip vpnexit_nat {");
-	push(t, "\tchain post {");
+	push(t, "\tchain vpx_nat {");
 	push(t, "\t\ttype nat hook postrouting priority srcnat; policy accept;");
 	push(t, sprintf("\t\toifname \"%s\" meta mark %s counter snat ip to %s", wan, mark, vip));
 	push(t, "\t}");
@@ -648,6 +648,40 @@ function routing_active(vip) {
 
 // ------------------------------------------------------------ connect flow
 
+// ------------------------------------------------------------------ selftest
+// Declared before do_connect() on purpose: ucode resolves function symbols at
+// compile time, so a call that appears earlier in the file would see null.
+
+function probe_ip(marked) {
+	if (marked) {
+		run("nft delete table inet vpnexit_probe");
+		run("nft add table inet vpnexit_probe");
+		run("nft add chain inet vpnexit_probe out '{ type route hook output priority mangle; policy accept; }'");
+		run("nft add rule inet vpnexit_probe out ip daddr 1.1.1.1 meta mark set " + cfg("mark", "0x1a1"));
+	}
+	let r = run("uclient-fetch -q -O - --timeout=12 " + shellq(PROBE));
+	if (marked) run("nft delete table inet vpnexit_probe");
+	let m = match(r.out, /ip=([0-9.]+)/);
+	return m ? m[1] : "";
+}
+
+function selftest_internal() {
+	let st = state_read();
+	if (!length(st.vip ?? "")) return { ok: false, detail: "tunnel is down" };
+	let temporary = false;
+	if (!routing_active(st.vip)) {
+		let rr = routing_apply(st.vip);
+		if (!rr.ok) return { ok: false, detail: rr.error };
+		temporary = true;
+	}
+	let direct = probe_ip(false);
+	let marked = probe_ip(true);
+	if (temporary) routing_clear();
+	if (!length(marked)) return { ok: false, detail: "no answer through the tunnel", direct: direct };
+	if (length(direct) && direct == marked) return { ok: false, detail: "traffic still leaves through the router uplink", direct: direct };
+	return { ok: true, ip: marked, direct: direct, detail: "exit verified" };
+}
+
 function wait_child(seconds) {
 	for (let i = 0; i < seconds; i++) {
 		let s = sas_parse();
@@ -662,7 +696,7 @@ function teardown(keep_state) {
 	run("swanctl --terminate --ike " + CONN);
 }
 
-function do_connect(key, index, verify) {
+function connect_impl(key, index, verify) {
 	let loc = find_location(key);
 	if (!loc) return { ok: false, error: "unknown location " + key };
 	let idx = intval(index, 0);
@@ -719,7 +753,7 @@ function do_connect(key, index, verify) {
 	return { ok: true, vip: s.vip, exit_ip: test.ip ?? "", warning: err };
 }
 
-function do_disconnect() {
+function disconnect_impl() {
 	log("disconnect");
 	teardown();
 	clear_conn_files();
@@ -727,36 +761,40 @@ function do_disconnect() {
 	return { ok: true };
 }
 
-// ------------------------------------------------------------------ selftest
+// --------------------------------------------------------------------- lock
+// One connect/disconnect at a time: the panel can be open in two tabs and the
+// supervisor may fire at the same moment, which would otherwise race on the
+// nftables table and the swanctl connection.
 
-function probe_ip(marked) {
-	if (marked) {
-		run("nft delete table inet vpnexit_probe");
-		run("nft add table inet vpnexit_probe");
-		run("nft add chain inet vpnexit_probe out '{ type route hook output priority mangle; policy accept; }'");
-		run("nft add rule inet vpnexit_probe out ip daddr 1.1.1.1 meta mark set " + cfg("mark", "0x1a1"));
+function lock_acquire() {
+	let dir = RUN + "/lock";
+	for (let i = 0; i < 40; i++) {
+		if (run("mkdir " + shellq(dir) + " 2>/dev/null").rc == 0) return true;
+		let st = fs.stat(dir);
+		if (st && (now() - st.mtime) > 180) { run("rmdir " + shellq(dir) + " 2>/dev/null"); continue; }
+		sleep(500);
 	}
-	let r = run("uclient-fetch -q -O - --timeout=12 " + shellq(PROBE));
-	if (marked) run("nft delete table inet vpnexit_probe");
-	let m = match(r.out, /ip=([0-9.]+)/);
-	return m ? m[1] : "";
+	return false;
 }
 
-function selftest_internal() {
-	let st = state_read();
-	if (!length(st.vip ?? "")) return { ok: false, detail: "tunnel is down" };
-	let temporary = false;
-	if (!routing_active(st.vip)) {
-		let rr = routing_apply(st.vip);
-		if (!rr.ok) return { ok: false, detail: rr.error };
-		temporary = true;
-	}
-	let direct = probe_ip(false);
-	let marked = probe_ip(true);
-	if (temporary) routing_clear();
-	if (!length(marked)) return { ok: false, detail: "no answer through the tunnel", direct: direct };
-	if (length(direct) && direct == marked) return { ok: false, detail: "traffic still leaves through the router uplink", direct: direct };
-	return { ok: true, ip: marked, direct: direct, detail: "exit verified" };
+function lock_release() { run("rmdir " + shellq(RUN + "/lock") + " 2>/dev/null"); }
+
+function do_connect(key, index, verify) {
+	if (!lock_acquire()) return { ok: false, error: "busy: another operation is running" };
+	let r;
+	try { r = connect_impl(key, index, verify); }
+	catch (e) { r = { ok: false, error: "" + e }; }
+	lock_release();
+	return r;
+}
+
+function do_disconnect() {
+	if (!lock_acquire()) return { ok: false, error: "busy: another operation is running" };
+	let r;
+	try { r = disconnect_impl(); }
+	catch (e) { r = { ok: false, error: "" + e }; }
+	lock_release();
+	return r;
 }
 
 // -------------------------------------------------------------------- status

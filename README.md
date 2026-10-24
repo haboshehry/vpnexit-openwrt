@@ -115,6 +115,18 @@ A tunnel established with that setting carried real traffic (exit address
 If you see a reboot during connect on a different device, check
 `/etc/strongswan.d/vpnexit.conf` first.
 
+Two more things were needed before connects became stable on that device:
+
+1. `strongswan-mod-kernel-libipsec` must not be active. With the plugin loaded
+   (the OpenWrt package enables it by default) the very same connect hung the
+   router even though `install_virtual_ip = no` was set. The installer now
+   disables it explicitly and the panel re-checks at start-up.
+2. nftables chain names cannot be reserved words: `mark`, `redirect` and
+   friends are statements, so the generated ruleset uses `vpx_*` names.
+
+Both are covered by the tests below; `vpnexit status` reports
+`routing.active = true` and a verified `exit_ip` when everything is healthy.
+
 ## Uninstall
 
 ```sh

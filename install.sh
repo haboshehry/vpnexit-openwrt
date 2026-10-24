@@ -96,6 +96,7 @@ charon {
 	port = 500
 	port_nat_t = 4500
 	plugins {
+		kernel-libipsec { load = no }
 		farp { load = no }
 		stroke { load = no }
 	}
