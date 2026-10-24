@@ -682,6 +682,21 @@ function selftest_internal() {
 	return { ok: true, ip: marked, direct: direct, detail: "exit verified" };
 }
 
+// charon writes the DNS servers it received into /etc/resolv.conf, replacing the
+// symlink OpenWrt uses. It also appends "  # by strongSwan" to the address line,
+// which makes busybox nslookup and dnsmasq reject the entry - the router then
+// resolves nothing while ICMP keeps working. Restore the symlink after every
+// connect and on each watchdog tick.
+function fix_resolv() {
+	let target = "/tmp/resolv.conf.d/resolv.conf.auto";
+	if (!fs.stat(target)) return;
+	let cur = trim(run("readlink /etc/resolv.conf").out);
+	if (length(cur) && index(cur, "resolv.conf.auto") >= 0) return;
+	run("ln -sfn " + target + " /etc/resolv.conf");
+	run("/etc/init.d/dnsmasq reload");
+	log("resolver: restored /etc/resolv.conf -> " + target);
+}
+
 function wait_child(seconds) {
 	for (let i = 0; i < seconds; i++) {
 		let s = sas_parse();
@@ -694,6 +709,12 @@ function wait_child(seconds) {
 function teardown(keep_state) {
 	routing_clear();
 	run("swanctl --terminate --ike " + CONN);
+	// Give charon time to delete the SAD/policies before anything reconnects.
+	for (let i = 0; i < 6; i++) {
+		let q = sas_parse();
+		if (!q.ike && !q.child) break;
+		sleep(500);
+	}
 }
 
 function connect_impl(key, index, verify) {
@@ -721,8 +742,25 @@ function connect_impl(key, index, verify) {
 	run("swanctl --terminate --ike " + CONN);
 	routing_clear();
 
-	let r = run("swanctl --initiate --child " + CHILD + " --timeout 25");
+	// charon needs a moment to tear down the previous SA; initiating while it is
+	// still deleting produces "existing duplicate CHILD_SA" and the whole
+	// connect would be reported as failed.
+	for (let i = 0; i < 10; i++) {
+		let q = sas_parse();
+		if (!q.ike && !q.child) break;
+		sleep(500);
+	}
+
+	let r = run("swanctl --initiate --child " + CHILD + " --timeout 30");
 	let s = wait_child(12);
+	if (!s.child || !length(s.vip)) {
+		// One controlled retry: peers occasionally reject the first attempt while
+		// the previous SA is still expiring on their side.
+		run("swanctl --terminate --ike " + CONN);
+		sleep(2000);
+		r = run("swanctl --initiate --child " + CHILD + " --timeout 30");
+		s = wait_child(12);
+	}
 	if (!s.child || !length(s.vip)) {
 		let msg = clean(r.out);
 		let m = match(msg, /\n[^\n]*(failed|error|no trusted|unable)[^\n]*/);
@@ -749,6 +787,7 @@ function connect_impl(key, index, verify) {
 		state: "connected", exit_ip: test.ip ?? "", error: err,
 		attempts: 0, checked_at: now(), vip: s.vip
 	});
+	fix_resolv();
 	log(sprintf("connect: up, vip %s, exit %s", s.vip, test.ip ?? "-"));
 	return { ok: true, vip: s.vip, exit_ip: test.ip ?? "", warning: err };
 }
@@ -756,6 +795,7 @@ function connect_impl(key, index, verify) {
 function disconnect_impl() {
 	log("disconnect");
 	teardown();
+	fix_resolv();
 	clear_conn_files();
 	state_patch({ state: "idle", vip: "", exit_ip: "", error: "", checked_at: now() });
 	return { ok: true };
@@ -835,6 +875,7 @@ function supervise_once() {
 
 	let s = sas_parse();
 	if (s.child) {
+		fix_resolv();
 		let vip = length(s.vip) ? s.vip : (st.vip ?? "");
 		let patch = { state: "connected", vip: vip, uptime: s.uptime, rx: s.rx, tx: s.tx, checked_at: now(), attempts: 0 };
 		if (cfg_bool("share_lan", true) && length(vip) && !routing_active(vip)) {
