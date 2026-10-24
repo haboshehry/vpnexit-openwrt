@@ -3,7 +3,8 @@
 set -e
 
 SRC=$(cd "$(dirname "$0")" && pwd)
-PKGS="strongswan-charon strongswan-swanctl \
+PKGS="ucode ucode-mod-fs ucode-mod-uci uclient-fetch \
+ strongswan-charon strongswan-swanctl \
  strongswan-mod-aes strongswan-mod-sha1 strongswan-mod-sha2 strongswan-mod-md5 \
  strongswan-mod-md4 strongswan-mod-des strongswan-mod-hmac strongswan-mod-kdf \
  strongswan-mod-gmp strongswan-mod-kernel-netlink strongswan-mod-socket-default \
@@ -14,7 +15,7 @@ PKGS="strongswan-charon strongswan-swanctl \
  strongswan-mod-eap-mschapv2 strongswan-mod-eap-identity \
  kmod-ipsec4 kmod-ipsec6 kmod-crypto-gcm kmod-crypto-authenc \
  kmod-crypto-sha256 kmod-crypto-hmac kmod-crypto-ctr kmod-crypto-aead \
- kmod-crypto-cbc kmod-crypto-echainiv kmod-crypto-seqiv ip-full openssl-util"
+ kmod-crypto-cbc kmod-crypto-echainiv kmod-crypto-seqiv ip-full openssl-util sshpass openssh-client"
 
 [ "$(id -u)" = "0" ] || { echo "run as root" >&2; exit 1; }
 [ -f /etc/openwrt_release ] || { echo "this is not OpenWrt" >&2; exit 1; }
@@ -148,7 +149,8 @@ echo "==> fetching profiles"
 /usr/sbin/vpnexit refresh >/dev/null 2>&1 || echo "    (feed fetch failed - retry from the panel)"
 
 TOKEN=$(uci -q get vpnexit.main.token)
-IP=$(uci -q get network.lan.ipaddr || echo 192.168.1.1)
+IP=$(uci -q get network.lan.ipaddr | cut -d/ -f1)
+[ -n "$IP" ] || IP=192.168.1.1
 cat <<EOF
 
   vpnexit is running.

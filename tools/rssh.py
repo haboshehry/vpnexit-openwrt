@@ -14,16 +14,23 @@ USER = os.environ.get("ROUTER_USER", "root")
 
 
 def connect():
+    """Open a session. A fresh OpenWrt has no root password, which dropbear
+    accepts through "none" authentication rather than an empty password, so
+    that is tried first and the password is used as a fallback."""
+    transport = paramiko.Transport((HOST, 22))
+    transport.start_client(timeout=15)
+    try:
+        transport.auth_none(USER)
+    except paramiko.SSHException:
+        password = os.environ.get("ROUTER_PASS")
+        if not password:
+            transport.close()
+            raise
+        transport.auth_password(USER, password)
+
     cli = paramiko.SSHClient()
     cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    cli.connect(
-        HOST,
-        username=USER,
-        password=os.environ["ROUTER_PASS"],
-        look_for_keys=False,
-        allow_agent=False,
-        timeout=15,
-    )
+    cli._transport = transport
     return cli
 
 
