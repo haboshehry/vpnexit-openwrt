@@ -87,6 +87,14 @@
         <input id="set-mtu" type="number" min="1200" max="1420" step="10"></label>
       <label class="field"><span data-i18n="feed_url">Profile feed URL</span>
         <input id="set-feed" type="url" placeholder="https://..."></label>
+      <div class="field">
+        <span data-i18n="token">Panel token</span>
+        <div class="row gap">
+          <input id="set-token" class="mono" type="text" autocomplete="off" spellcheck="false">
+          <button id="btn-token-gen" class="btn ghost small" data-i18n="token_new">New</button>
+        </div>
+        <p class="muted small" data-i18n="token_hint">Used by the panel and the API. Changing it signs this browser in with the new value.</p>
+      </div>
       <button id="btn-save-settings" class="btn primary" data-i18n="save">Save</button>
     </div>
     <div class="card">

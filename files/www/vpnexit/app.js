@@ -16,6 +16,8 @@
       block_v6: "Block IPv6 while the tunnel is up",
       auto_reconnect: "Reconnect automatically",
       mtu: "Tunnel MTU", feed_url: "Profile feed URL",
+      token: "Panel token", token_new: "New",
+      token_hint: "Used by the panel and the API. Changing it signs this browser in with the new value.",
       diag: "Diagnostics", show_log: "Show log",
       connect: "Connect", disconnect: "Disconnect", test: "Test", edit: "Edit",
       delete: "Delete", share: "Share", shared: "Shared", stop: "Remove from LAN",
@@ -36,6 +38,8 @@
       block_v6: "بستن IPv6 هنگام فعال بودن تونل",
       auto_reconnect: "اتصال مجدد خودکار",
       mtu: "MTU تونل", feed_url: "آدرس لیست پروفایل",
+      token: "توکن پنل", token_new: "جدید",
+      token_hint: "پنل و API با این توکن کار می‌کنند. با تغییر آن، همین مرورگر با مقدار جدید وارد می‌شود.",
       diag: "عیب‌یابی", show_log: "نمایش لاگ",
       connect: "اتصال", disconnect: "قطع", test: "تست", edit: "ویرایش",
       delete: "حذف", share: "اشتراک", shared: "به اشتراک گذاشته شد", stop: "حذف از شبکه",
@@ -388,19 +392,49 @@
     $("set-v6").checked = !!s.block_ipv6;
     $("set-auto").checked = !!s.auto_reconnect;
     $("set-mtu").value = s.tunnel_mtu || 1400;
-    $("set-feed").value = s.feed_url || "";
-    $("ver").textContent = s.version ? "v" + s.version : "";
+      $("set-feed").value = s.feed_url || "";
+      $("set-token").value = s.token || "";
+      $("ver").textContent = s.version ? "v" + s.version : "";
   }
+
+  function randomToken() {
+    var bytes = new Uint8Array(16);
+    if (window.crypto && crypto.getRandomValues) crypto.getRandomValues(bytes);
+    else for (var i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+    var out = "";
+    for (var j = 0; j < 16; j++) out += ("0" + bytes[j].toString(16)).slice(-2);
+    return out;
+  }
+
+  $("btn-token-gen").addEventListener("click", function () {
+    var v = randomToken();
+    $("set-token").value = v;
+    $("set-token").focus();
+    $("set-token").select();
+  });
   $("btn-save-settings").addEventListener("click", function () {
     var btn = $("btn-save-settings");
-    busy(btn, api("settings", {
+    var body = {
       share_lan: $("set-share").checked,
       block_ipv6: $("set-v6").checked,
       auto_reconnect: $("set-auto").checked,
       tunnel_mtu: +$("set-mtu").value || 1400,
       feed_url: $("set-feed").value.trim() || undefined
-    }).then(function (r) {
-      if (r.ok) { renderSettings(r.settings); toast(t("save") + " ok"); }
+    };
+    // The token is only sent when it actually changed: it is the credential
+    // every request uses, so the browser has to switch together with the box.
+    var tok = $("set-token").value.trim();
+    var changed = tok.length >= 8 && tok !== state.token;
+    if (changed) body.token = tok;
+    busy(btn, api("settings", body).then(function (r) {
+      if (!r.ok) { $("m-msg").textContent = r.error || ""; return; }
+      if (changed) {
+        state.token = tok;
+        localStorage.setItem(LS_TOKEN, tok);
+        document.cookie = "vpnexit=" + encodeURIComponent(tok) + "; path=/; max-age=31536000; SameSite=Strict";
+      }
+      renderSettings(r.settings);
+      toast(t("save") + " ok");
     }));
   });
   $("btn-log").addEventListener("click", function () {

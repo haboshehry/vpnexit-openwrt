@@ -61,7 +61,8 @@ sh install.sh --with-deps  # also install the VPN clients
 
 The panel is then at `http://<router>/vpnexit/`. The first request asks for the
 token; it is printed by `install.sh` and stored in `/etc/config/vpnexit`
-(`token`). To read it again:
+(`token`). It can also be read, replaced or regenerated from **Settings →
+Panel token**. To read it from a shell:
 
 ```sh
 uci get vpnexit.main.token
