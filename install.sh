@@ -53,6 +53,15 @@ chmod 0644 /www/vpnexit/* /usr/share/vpnexit/* 2>/dev/null || true
 cp /usr/share/vpnexit/vpnexit.uc /www/vpnexit/source.txt
 chmod 0644 /www/vpnexit/source.txt
 
+# --------------------------------------------------------- 2b. VPN clients
+# The optional clients come from the same script the panel calls, so a target
+# where one of them cannot be installed (openvpn needs a kmod that is not built
+# everywhere) does not abort the installation.
+if [ "${SKIP_DEPS:-0}" != "1" ]; then
+	echo "==> installing the optional VPN clients"
+	sh /usr/share/vpnexit/install-deps.sh || echo "!! some clients are missing, the panel lists them"
+fi
+
 # LuCI caches the menu tree; drop it so "Services -> VPN Exit" shows up at once.
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null || true
 

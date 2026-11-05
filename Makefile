@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=vpnexit
-PKG_VERSION:=1.0.0
+PKG_VERSION:=2.0.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=haboshehry
@@ -18,7 +18,7 @@ define Package/vpnexit
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=VPN
-  TITLE:=IKEv2 exit switcher with LAN sharing
+  TITLE:=Multi-protocol VPN exit panel with LAN sharing
   DEPENDS:=+ucode +ucode-mod-fs +ucode-mod-uci +uclient-fetch +openssl-util +ip-full \
 	+strongswan-charon +strongswan-swanctl +strongswan-mod-eap-mschapv2 \
 	+strongswan-mod-eap-identity +strongswan-mod-openssl +strongswan-mod-gcm \

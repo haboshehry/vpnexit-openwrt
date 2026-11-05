@@ -1,4 +1,4 @@
-/* vpnexit panel – no framework, no external assets */
+/* vpnexit panel - no framework, no external assets */
 (function () {
   "use strict";
 
@@ -6,568 +6,479 @@
   var LS_TOKEN = "vpnexit.token";
   var LS_LANG = "vpnexit.lang";
 
-  var I18N = {
+  var T = {
     en: {
-      dir: "ltr",
-      brandSub: "OpenWrt · LAN & Wi-Fi sharing",
-      idle: "Idle", connected: "Connected", connecting: "Connecting…", error: "Error",
-      notConnected: "Not connected",
-      notConnectedSub: "Traffic from your devices goes straight to the internet.",
-      connectedTo: "Connected to {0}",
-      connectedSub: "Every wired and Wi-Fi device now uses this exit.",
-      partialSub: "Tunnel is up, but LAN sharing is off.",
-      connect: "Connect", disconnect: "Disconnect", reconnect: "Reconnect", selftest: "Self-test",
-      exitIp: "Exit IP", tunnelIp: "Tunnel IP", uptime: "Uptime", traffic: "Traffic",
-      locations: "Locations", search: "Search country…", refresh: "Update list",
-      refreshing: "Updating…", premium: "premium", servers: "{0} server(s)",
-      connectShort: "Connect", disconnectShort: "Disconnect",
-      empty: "No locations yet. Press Refresh to download the feed.",
-      emptyFilter: "Nothing matches your search.",
-      activity: "Activity log", show: "Show", hide: "Hide",
-      settings: "Settings",
-      shareT: "Share with LAN devices", shareD: "Route traffic from every wired and Wi-Fi client through the tunnel.",
-      v6T: "Block IPv6 for LAN devices", v6D: "Prevents IPv6 traffic from bypassing the tunnel.",
-      autoT: "Auto-reconnect", autoD: "Re-establish the tunnel when the peer drops it.",
-      mtuT: "Tunnel MTU", mtuD: "Lower it if large downloads stall.",
-      feedT: "Profile feed", feedD: "JSON feed refreshed every day.",
-      tokT: "Admin token", tokD: "Required for every change from this page.",
-      save: "Save", saved: "Saved", newTok: "New",
-      gateTitle: "Admin token", gateHint: "Paste the token printed by the installer.",
-      unlock: "Unlock", badToken: "Wrong token.",
-      toastConnected: "Connected", toastDisconnected: "Disconnected",
-      toastRefreshed: "Feed updated", toastError: "Something went wrong",
-      testOk: "Exit verified: {0}", testFail: "Self-test failed",
-      foot: "vpnexit · router-side IKEv2 client",
-      confirmDisc: "Disconnect the tunnel and stop sharing it with the LAN?",
-      updating: "Working…",
-      source: "Backend source", openRaw: "Open raw", close: "Close",
-      srcHint: "This file lives outside the web root and has no direct URL.",
-      chooseServer: "Choose server", pickServer: "Pick the server to connect to.",
-      serverN: "Server {0}", busy: "Another operation is still running, try again in a moment."
+      tab_manual: "Connections", tab_feed: "Exit feed", tab_settings: "Settings",
+      add: "Add connection", save: "Save", cancel: "Cancel", refresh: "Refresh",
+      no_conn: "No connections yet.", feed_empty: "No locations loaded.",
+      manual_hint: "Add a profile for each VPN you use, connect it, then share it with the LAN.",
+      share_lan: "Share the tunnel with LAN clients",
+      block_v6: "Block IPv6 while the tunnel is up",
+      auto_reconnect: "Reconnect automatically",
+      mtu: "Tunnel MTU", feed_url: "Profile feed URL",
+      diag: "Diagnostics", show_log: "Show log",
+      connect: "Connect", disconnect: "Disconnect", test: "Test", edit: "Edit",
+      delete: "Delete", share: "Share", shared: "Shared", stop: "Remove from LAN",
+      connecting: "connecting", connected: "connected", idle: "idle", error: "error",
+      exit_ip: "Exit IP", tunnel: "Tunnel", uptime: "Uptime", traffic: "Traffic",
+      install_deps: "Install missing clients",
+      deps_missing: "Some clients are not installed yet:",
+      token_bad: "Wrong token", untested: "not tested",
+      paste: "Paste the configuration file here",
+      confirm_delete: "Delete this connection?"
     },
     fa: {
-      dir: "rtl",
-      brandSub: "OpenWrt · اشتراک در LAN و وای‌فای",
-      idle: "غیرفعال", connected: "متصل", connecting: "در حال اتصال…", error: "خطا",
-      notConnected: "متصل نیست",
-      notConnectedSub: "ترافیک دستگاه‌های شما مستقیم به اینترنت می‌رود.",
-      connectedTo: "متصل به {0}",
-      connectedSub: "همه دستگاه‌های کابلی و وای‌فای اکنون از این خروجی استفاده می‌کنند.",
-      partialSub: "تونل برقرار است اما اشتراک‌گذاری با LAN خاموش است.",
-      connect: "اتصال", disconnect: "قطع", reconnect: "اتصال مجدد", selftest: "تست خودکار",
-      exitIp: "IP خروجی", tunnelIp: "IP تونل", uptime: "مدت اتصال", traffic: "ترافیک",
-      locations: "موقعیت‌ها", search: "جستجوی کشور…", refresh: "به‌روزرسانی لیست",
-      refreshing: "در حال به‌روزرسانی…", premium: "ویژه", servers: "{0} سرور",
-      connectShort: "اتصال", disconnectShort: "قطع",
-      empty: "فهرستی موجود نیست. دکمه به‌روزرسانی را بزنید.",
-      emptyFilter: "موردی با این جستجو پیدا نشد.",
-      activity: "گزارش فعالیت", show: "نمایش", hide: "بستن",
-      settings: "تنظیمات",
-      shareT: "اشتراک با دستگاه‌های LAN", shareD: "ترافیک همه کلاینت‌های کابلی و وای‌فای از تونل عبور کند.",
-      v6T: "مسدودکردن IPv6 برای LAN", v6D: "جلوگیری از عبور ترافیک IPv6 از بیرون تونل.",
-      autoT: "اتصال خودکار مجدد", autoD: "اگر سرور اتصال را قطع کرد، تونل دوباره برقرار شود.",
-      mtuT: "MTU تونل", mtuD: "در صورت گیرکردن دانلودهای بزرگ، کمترش کنید.",
-      feedT: "منبع پروفایل‌ها", feedD: "فید JSON که روزانه به‌روزرسانی می‌شود.",
-      tokT: "توکن مدیریت", tokD: "برای هر تغییر از این صفحه لازم است.",
-      save: "ذخیره", saved: "ذخیره شد", newTok: "جدید",
-      gateTitle: "توکن مدیریت", gateHint: "توکنی را که نصب‌کننده چاپ کرده وارد کنید.",
-      unlock: "ورود", badToken: "توکن نادرست است.",
-      toastConnected: "متصل شد", toastDisconnected: "قطع شد",
-      toastRefreshed: "فهرست به‌روز شد", toastError: "خطایی رخ داد",
-      testOk: "خروجی تأیید شد: {0}", testFail: "تست خودکار ناموفق بود",
-      foot: "vpnexit · کلاینت IKEv2 روی روتر",
-      confirmDisc: "تونل قطع و اشتراک‌گذاری با LAN متوقف شود؟",
-      updating: "در حال انجام…",
-      source: "سورس بک‌اند", openRaw: "نمایش خام", close: "بستن",
-      srcHint: "این فایل خارج از ریشهٔ وب است و آدرس مستقیم ندارد.",
-      chooseServer: "انتخاب سرور", pickServer: "سروری را که می‌خواهید به آن وصل شوید انتخاب کنید.",
-      serverN: "سرور {0}", busy: "یک عملیات دیگر در حال اجراست؛ چند لحظه بعد دوباره تلاش کنید."
+      tab_manual: "اتصال‌ها", tab_feed: "لیست خروج", tab_settings: "تنظیمات",
+      add: "افزودن اتصال", save: "ذخیره", cancel: "انصراف", refresh: "بروزرسانی",
+      no_conn: "هنوز اتصالی اضافه نشده.", feed_empty: "لیستی بارگذاری نشده.",
+      manual_hint: "برای هر VPN یک پروفایل بسازید، وصل کنید و با شبکه محلی به اشتراک بگذارید.",
+      share_lan: "اشتراک تونل با کاربران شبکه محلی",
+      block_v6: "بستن IPv6 هنگام فعال بودن تونل",
+      auto_reconnect: "اتصال مجدد خودکار",
+      mtu: "MTU تونل", feed_url: "آدرس لیست پروفایل",
+      diag: "عیب‌یابی", show_log: "نمایش لاگ",
+      connect: "اتصال", disconnect: "قطع", test: "تست", edit: "ویرایش",
+      delete: "حذف", share: "اشتراک", shared: "به اشتراک گذاشته شد", stop: "حذف از شبکه",
+      connecting: "در حال اتصال", connected: "متصل", idle: "آماده", error: "خطا",
+      exit_ip: "IP خروجی", tunnel: "تونل", uptime: "مدت اتصال", traffic: "ترافیک",
+      install_deps: "نصب کلاینت‌های نصب‌نشده",
+      deps_missing: "این کلاینت‌ها نصب نیستند:",
+      token_bad: "توکن اشتباه است", untested: "تست نشده",
+      paste: "محتوای فایل کانفیگ را اینجا بچسبانید",
+      confirm_delete: "این اتصال حذف شود؟"
     }
   };
 
-  var lang = localStorage.getItem(LS_LANG) || (navigator.language || "en").slice(0, 2);
-  if (!I18N[lang]) lang = "en";
+  var lang = localStorage.getItem(LS_LANG) || "en";
+  function t(k) { return (T[lang] && T[lang][k]) || T.en[k] || k; }
 
-  var state = {
-    token: localStorage.getItem(LS_TOKEN) || "",
-    status: null,
-    locations: null,
-    busy: false,
-    timer: null,
-    filter: ""
+  var TYPES = {
+    ikev2: { label: "IKEv2", hint: "EAP-MSCHAPv2 or a pre-shared key" },
+    l2tp: { label: "L2TP/IPsec", hint: "IPsec PSK + PPP account" },
+    sstp: { label: "SSTP", hint: "Microsoft SSTP over TLS" },
+    openvpn: { label: "OpenVPN", hint: "Paste a .ovpn profile" },
+    wireguard: { label: "WireGuard", hint: "Paste a wg.conf" },
+    amneziawg: { label: "AmneziaWG", hint: "Paste an Amnezia config" },
+    vless: { label: "VLESS", hint: "Paste a vless:// URL (REALITY supported)" }
   };
 
-  function t(key) {
-    var s = (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key;
-    for (var i = 1; i < arguments.length; i++) s = s.replace("{" + (i - 1) + "}", arguments[i]);
-    return s;
-  }
+  var FIELDS = {
+    ikev2: [
+      { k: "server", label: "Server", ph: "vpn.example.com" },
+      { k: "remote_id", label: "Remote ID", ph: "optional, defaults to the server" },
+      { k: "username", label: "Username" },
+      { k: "password", label: "Password", type: "password" },
+      { k: "psk", label: "Pre-shared key", ph: "optional - use instead of EAP" }
+    ],
+    l2tp: [
+      { k: "server", label: "Server", ph: "vpn.example.com" },
+      { k: "username", label: "Username" },
+      { k: "password", label: "Password", type: "password" },
+      { k: "psk", label: "IPsec pre-shared key", type: "password" }
+    ],
+    sstp: [
+      { k: "server", label: "Server", ph: "vpn.example.com" },
+      { k: "port", label: "Port", ph: "443" },
+      { k: "username", label: "Username" },
+      { k: "password", label: "Password", type: "password" }
+    ],
+    openvpn: [
+      { k: "raw", label: "Profile", area: true, rows: 12 },
+      { k: "username", label: "Username", ph: "optional" },
+      { k: "password", label: "Password", type: "password", ph: "optional" }
+    ],
+    wireguard: [{ k: "raw", label: "wg.conf", area: true, rows: 12 }],
+    amneziawg: [{ k: "raw", label: "AmneziaWG config", area: true, rows: 12 }],
+    vless: [{ k: "raw", label: "vless:// URL", area: true, rows: 6 }]
+  };
+
+  var state = { token: localStorage.getItem(LS_TOKEN) || "", status: null, conns: [], feed: [], caps: {}, editing: null, type: "ikev2" };
+
+  // --------------------------------------------------------------- helpers
   function $(id) { return document.getElementById(id); }
-  function esc(s) {
-    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
-      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
-    });
-  }
-  function bytes(n) {
-    n = Number(n) || 0;
+  function esc(s) { return ("" + (s == null ? "" : s)).replace(/[&<>"']/g, function (c) { return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]; }); }
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+  function byteStr(n) {
+    n = +n || 0;
     if (n < 1024) return n + " B";
-    var u = ["KB", "MB", "GB", "TB"], i = -1;
-    do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
-    return (n >= 10 ? n.toFixed(0) : n.toFixed(1)) + " " + u[i];
+    if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + " MB";
+    return (n / 1073741824).toFixed(2) + " GB";
   }
-  function duration(sec) {
-    sec = Math.max(0, Math.floor(Number(sec) || 0));
-    var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  function dur(sec) {
+    sec = +sec || 0;
+    if (!sec) return "-";
+    var d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
+    if (d) return d + "d " + h + "h";
     if (h) return h + "h " + m + "m";
-    if (m) return m + "m " + s + "s";
-    return s + "s";
+    return m + "m";
   }
-  function toast(msg, kind) {
-    var box = $("toasts"), el = document.createElement("div");
-    el.className = "toast" + (kind ? " " + kind : "");
-    el.textContent = msg;
-    box.appendChild(el);
-    setTimeout(function () { el.remove(); }, 3600);
-  }
-
-  // uhttpd only forwards a fixed set of headers to CGI scripts, so the token
-  // travels in a cookie as well (it is also kept in localStorage for the UI).
-  function setCookie(t) {
-    document.cookie = "vpnexit=" + encodeURIComponent(t) + "; path=/; max-age=31536000; SameSite=Strict";
-  }
-  function dropCookie() {
-    document.cookie = "vpnexit=; path=/; max-age=0; SameSite=Strict";
+  var toastTimer = null;
+  function toast(msg, bad) {
+    var box = $("toast");
+    box.textContent = msg;
+    box.className = "toast" + (bad ? " bad" : "");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { box.className = "toast hidden"; }, 4200);
   }
 
-  function api(path, opts) {
-    opts = opts || {};
-    var headers = { "Accept": "application/json" };
-    if (state.token) headers["X-Auth-Token"] = state.token;
-    if (opts.body) headers["Content-Type"] = "application/json";
-    // uhttpd drops custom headers and cookies for CGI, so the token also
-    // travels in the query string (this panel is LAN-only, plain HTTP anyway).
-    var url = API + path + (path.indexOf("?") >= 0 ? "&" : "?") + "t=" + encodeURIComponent(state.token || "");
-    return fetch(url, {
-      method: opts.method || (opts.body ? "POST" : "GET"),
-      headers: headers,
-      body: opts.body ? JSON.stringify(opts.body) : undefined,
-      cache: "no-store"
-    }).then(function (r) {
-      return r.text().then(function (txt) {
-        var data;
-        try { data = JSON.parse(txt); } catch (e) { data = { ok: false, error: txt.slice(0, 200) || ("HTTP " + r.status) }; }
-        if (r.status === 401) { openGate(); data.ok = false; data.unauthorized = true; }
-        else if (!r.ok && data.ok !== false) { data.ok = false; data.error = "HTTP " + r.status; }
-        return data;
-      });
-    }).catch(function (e) {
-      return { ok: false, error: String(e && e.message || e) };
+  function api(path, body, method) {
+    var opt = { method: method || (body ? "POST" : "GET"), headers: {}, credentials: "same-origin" };
+    if (body) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+    return fetch(API + path, opt).then(function (r) {
+      if (r.status === 401) { askToken(); throw new Error("unauthorized"); }
+      return r.json();
     });
   }
 
-  /* ---------- i18n application ---------- */
-  var TEXT_MAP = {
-    brandSub: "brandSub", settings: "setTitle", shareT: "setShareT", shareD: "setShareD",
-    v6T: "setV6T", v6D: "setV6D", autoT: "setAutoT", autoD: "setAutoD",
-    mtuT: "setMtuT", mtuD: "setMtuD", feedT: "setFeedT", feedD: "setFeedD",
-    tokT: "setTokT", tokD: "setTokD", save: "saveSettings", gateTitle: "gateTitle",
-    gateHint: "gateHint", unlock: "gateBtn", foot: "footNote", activity: "logTitle",
-    locations: "locTitle", source: "srcTitle", openRaw: "srcRaw", close: "srcCloseBtn"
-  };
-
-  function applyLang() {
-    document.documentElement.lang = lang;
-    document.documentElement.dir = I18N[lang].dir;
-    for (var k in TEXT_MAP) {
-      var el = $(TEXT_MAP[k]);
-      if (el) el.textContent = t(k);
-    }
-    $("langBtn").textContent = lang === "fa" ? "EN" : "FA";
-    $("search").placeholder = t("search");
-    $("refreshLabel").textContent = t("refresh");
-    $("cfgTokenGen").textContent = t("newTok");
-    if (state.status) renderStatus();
-    if (state.locations) renderLocations();
+  // ------------------------------------------------------------------ gate
+  function askToken() {
+    $("app").classList.add("hidden");
+    $("gate").classList.remove("hidden");
+    $("gate-token").focus();
   }
-
-  /* ---------- rendering ---------- */
-  function stateBadge(st) {
-    var s = st && st.state || "idle";
-    if (s === "connected" && st.routing && st.routing.active === false) return ["badge-busy", t("idle")];
-    if (s === "connected") return ["badge-ok", t("connected")];
-    if (s === "connecting") return ["badge-busy", t("connecting")];
-    if (s === "error") return ["badge-err", t("error")];
-    return ["badge-idle", t("idle")];
+  function useToken(tok) {
+    state.token = tok;
+    localStorage.setItem(LS_TOKEN, tok);
+    document.cookie = "vpnexit=" + encodeURIComponent(tok) + "; path=/; max-age=31536000; SameSite=Strict";
+    $("gate").classList.add("hidden");
+    $("app").classList.remove("hidden");
+    boot();
   }
-
-  function renderStatus() {
-    var st = state.status || { state: "idle" };
-    var b = stateBadge(st);
-    $("connBadge").className = "badge " + b[0];
-    $("connBadge").lastElementChild.textContent = b[1];
-
-    var connected = st.state === "connected";
-    var loc = st.location || null;
-
-    $("statusFlag").textContent = loc ? (loc.flag || "🌐") : "🌐";
-    if (connected && loc) {
-      $("statusTitle").textContent = t("connectedTo", loc.title || loc.key);
-      $("statusSub").textContent = (st.routing && st.routing.active === false) ? t("partialSub") : t("connectedSub");
-    } else if (st.state === "connecting") {
-      $("statusTitle").textContent = t("connecting");
-      $("statusSub").textContent = loc ? (loc.title || loc.key) : "";
-    } else if (st.state === "error") {
-      $("statusTitle").textContent = t("error");
-      $("statusSub").textContent = st.error || t("notConnectedSub");
-    } else {
-      $("statusTitle").textContent = t("notConnected");
-      $("statusSub").textContent = t("notConnectedSub");
-    }
-
-    var pb = $("primaryBtn");
-    pb.textContent = connected ? t("disconnect") : t("connect");
-    pb.className = "btn " + (connected ? "btn-danger" : "btn-primary");
-    pb.disabled = state.busy || st.state === "connecting";
-    $("testBtn").hidden = !connected;
-    $("testBtn").textContent = t("selftest");
-    $("testBtn").disabled = state.busy;
-
-    $("mExit").textContent = st.exit_ip || "—";
-    $("mVip").textContent = st.vip || "—";
-    $("mUp").textContent = connected && st.uptime ? duration(st.uptime) : "—";
-    $("mTraffic").textContent = connected ? (bytes(st.rx) + " ↓ · " + bytes(st.tx) + " ↑") : "—";
-
-    var warn = $("warnBox");
-    if (st.warning) { warn.hidden = false; warn.textContent = st.warning; }
-    else { warn.hidden = true; warn.textContent = ""; }
-  }
-
-  function renderLocations() {
-    var box = $("locList");
-    var data = state.locations || { items: [] };
-    var items = data.items || [];
-    var f = state.filter.trim().toLowerCase();
-    if (f) {
-      items = items.filter(function (it) {
-        return (it.title + " " + it.key + " " + (it.country || "")).toLowerCase().indexOf(f) >= 0;
-      });
-    }
-    box.innerHTML = "";
-    var empty = $("locEmpty");
-    if (!items.length) {
-      empty.hidden = false;
-      empty.textContent = (state.locations && state.locations.items && state.locations.items.length) ? t("emptyFilter") : t("empty");
-    } else {
-      empty.hidden = true;
-    }
-
-    var activeKey = state.status && state.status.location && state.status.location.key;
-    var activeIndex = state.status && state.status.server ? Number(state.status.server.index || 0) : -1;
-    var frag = document.createDocumentFragment();
-    items.forEach(function (it) {
-      (it.servers || []).forEach(function (srv, serverIndex) {
-        var row = document.createElement("div");
-        var isActive = it.key === activeKey && serverIndex === activeIndex && state.status.state === "connected";
-        row.className = "loc-row" + (isActive ? " active" : "");
-        row.setAttribute("role", "listitem");
-        row.innerHTML =
-          '<div class="loc-flag">' + esc(it.flag || "🌐") + "</div>" +
-          '<div class="loc-info">' +
-            '<div class="loc-name">' + esc(it.title || it.key) +
-              ' <span class="pill">' + esc(t("serverN", serverIndex + 1)) + "</span>" +
-              (it.premium ? ' <span class="pill">' + esc(t("premium")) + "</span>" : "") +
-              (isActive ? ' <span class="dot"></span>' : "") +
-            "</div>" +
-            '<div class="loc-meta">' + esc((it.country || "") + " · " + (srv.host || "") + (srv.ip ? " · " + srv.ip : "")) + "</div>" +
-          "</div>";
-        var btn = document.createElement("button");
-        btn.className = "btn sm " + (isActive ? "btn-danger" : "btn-ghost");
-        btn.textContent = isActive ? t("disconnectShort") : t("connectShort");
-        btn.disabled = state.busy;
-        btn.addEventListener("click", function () {
-          if (isActive) disconnect(); else connect(it.key, serverIndex, btn);
-        });
-        row.appendChild(btn);
-        frag.appendChild(row);
-      });
+  $("gate-go").addEventListener("click", function () {
+    var tok = $("gate-token").value.trim();
+    if (!tok) return;
+    api("health").then(function () { useToken(tok); }).catch(function () {
+      useToken(tok);
     });
-    box.appendChild(frag);
-
-    var meta = $("locMeta");
-    if (data.fetched_at) {
-      var d = new Date(data.fetched_at * 1000);
-      meta.textContent = data.count + " · " + d.toLocaleString(lang === "fa" ? "fa-IR" : undefined);
-    } else {
-      meta.textContent = "—";
-    }
-  }
-
-  /* ---------- actions ---------- */
-  function setBusy(on, label) {
-    state.busy = on;
-    document.body.style.cursor = on ? "progress" : "";
-    if (label) toast(label);
-    renderStatus();
-  }
-
-  function loadStatus() {
-    return api("status").then(function (r) {
-      if (r.ok) { state.status = r.status || r; renderStatus(); }
-      return r;
-    });
-  }
-
-  function loadLocations(force) {
-    return api("locations" + (force ? "?refresh=1" : "")).then(function (r) {
-      if (r.ok) { state.locations = r; renderLocations(); }
-      else if (!r.unauthorized) toast(r.error || t("toastError"), "err");
-      return r;
-    });
-  }
-
-  function loadSettings() {
-    return api("settings").then(function (r) {
-      if (!r.ok) return r;
-      var s = r.settings || {};
-      $("cfgShareLan").checked = !!s.share_lan;
-      $("cfgBlockV6").checked = !!s.block_ipv6;
-      $("cfgAuto").checked = !!s.auto_reconnect;
-      $("cfgMtu").value = s.tunnel_mtu || 1400;
-      $("cfgFeed").value = s.feed_url || "";
-      $("cfgToken").value = s.token || state.token;
-      $("footVersion").textContent = s.version ? "v" + s.version : "";
-      return r;
-    });
-  }
-
-  function connect(key, index, btn) {
-    if (state.busy) return;
-    setBusy(true);
-    if (btn) btn.disabled = true;
-    state.status = { state: "connecting", location: (state.locations ? state.locations.items : []).filter(function (x) { return x.key === key; })[0] };
-    renderStatus();
-    api("connect", { body: { key: key, index: index || 0 } }).then(function (r) {
-      setBusy(false);
-      if (r.ok) {
-        toast(t("connecting"), "ok");
-        setTimeout(function () { loadStatus(); }, 800);
-      } else if (!r.unauthorized) {
-        toast((r.error || "").indexOf("busy") === 0 ? t("busy") : (r.error || t("toastError")), "err");
-        loadStatus();
-      }
-      return null;
-    }).then(function () { if (state.locations) renderLocations(); });
-  }
-
-  function disconnect() {
-    if (state.busy) return;
-    if (!confirm(t("confirmDisc"))) return;
-    setBusy(true);
-    api("disconnect", { body: {} }).then(function (r) {
-      setBusy(false);
-      if (r.ok) toast(t("toastDisconnected"), "ok");
-      else if (!r.unauthorized) toast(r.error || t("toastError"), "err");
-      return loadStatus();
-    }).then(function () { if (state.locations) renderLocations(); });
-  }
-
-  function selftest() {
-    if (state.busy) return;
-    setBusy(true, t("updating"));
-    api("selftest", { body: {} }).then(function (r) {
-      setBusy(false);
-      if (r.ok && r.result && r.result.ok) toast(t("testOk", r.result.ip || "?"), "ok");
-      else toast((r.result && r.result.detail) || r.error || t("testFail"), "err");
-      return loadStatus();
-    });
-  }
-
-  function setRefreshing(on) {
-    ["refreshBtn", "refreshTop"].forEach(function (id) {
-      var el = $(id);
-      if (el) el.disabled = on;
-    });
-    var icons = document.querySelectorAll("#refreshIcon, #refreshTop svg");
-    Array.prototype.forEach.call(icons, function (i) {
-      i.classList.toggle("spin-icon", on);
-    });
-    $("refreshLabel").textContent = on ? t("refreshing") : t("refresh");
-  }
-
-  // Manual feed refresh: downloads the JSON again and re-renders the list.
-  function refreshFeed() {
-    if (state.busy) { toast(t("busy"), "err"); return; }
-    setRefreshing(true);
-    api("refresh", { body: {} }).then(function (r) {
-      setRefreshing(false);
-      if (r.ok) {
-        toast(t("toastRefreshed") + " (" + (r.count || 0) + ")", "ok");
-        return loadLocations(false);
-      }
-      if (!r.unauthorized) toast(r.error || t("toastError"), "err");
-      return null;
-    }).catch(function () { setRefreshing(false); });
-  }
-
-  function openGate() {
-    $("gate").hidden = false;
-    $("gateErr").hidden = true;
-    setTimeout(function () { $("tokenInput").focus(); }, 50);
-  }
-
-  function saveSettings() {
-    var body = {
-      share_lan: $("cfgShareLan").checked,
-      block_ipv6: $("cfgBlockV6").checked,
-      auto_reconnect: $("cfgAuto").checked,
-      tunnel_mtu: Number($("cfgMtu").value) || 1400,
-      feed_url: $("cfgFeed").value.trim(),
-      token: $("cfgToken").value.trim()
-    };
-    if (body.token && body.token !== state.token) {
-      state.token = body.token;
-      localStorage.setItem(LS_TOKEN, state.token);
-    }
-    api("settings", { body: body }).then(function (r) {
-      if (r.ok) { toast(t("saved"), "ok"); $("drawer").hidden = true; loadStatus(); }
-      else {
-        var e = $("setErr"); e.hidden = false; e.textContent = r.error || t("toastError");
-      }
-    });
-  }
-
-  function openServerPicker(loc) {
-    $("srvTitle").textContent = (loc.flag ? loc.flag + " " : "") + (loc.title || loc.key);
-    $("srvHint").textContent = t("servers", (loc.servers || []).length) + " — " + t("pickServer");
-    var box = $("srvList");
-    box.innerHTML = "";
-    (loc.servers || []).forEach(function (s, i) {
-      var row = document.createElement("div");
-      row.className = "loc-row";
-      row.innerHTML =
-        '<div class="loc-flag" style="font-size:13px;font-weight:700">' + (i + 1) + "</div>" +
-        '<div class="loc-info"><div class="loc-name">' + esc(s.host) + "</div>" +
-        '<div class="loc-meta">' + esc(s.ip || "") + "</div></div>";
-      var b = document.createElement("button");
-      b.className = "btn sm btn-primary";
-      b.textContent = t("connectShort");
-      b.addEventListener("click", function () {
-        $("serverModal").hidden = true;
-        connect(loc.key, i, null);
-      });
-      row.appendChild(b);
-      box.appendChild(row);
-    });
-    $("serverModal").hidden = false;
-  }
-
-  function openSource() {
-    $("sourceModal").hidden = false;
-    $("srcCode").textContent = "…";
-    $("srcRaw").href = API + "source?raw=1&t=" + encodeURIComponent(state.token || "");
-    api("source").then(function (r) {
-      if (!r.ok) { $("srcCode").textContent = r.error || t("toastError"); return; }
-      $("srcPath").textContent = r.path + " · " + r.bytes + " B — " + t("srcHint");
-      $("srcCode").textContent = r.text;
-    });
-  }
-
-  function toggleLog(show) {
-    var box = $("logBox");
-    var on = show == null ? box.hidden : show;
-    box.hidden = !on;
-    $("logToggle").textContent = on ? t("hide") : t("show");
-    if (on) {
-      api("log?lines=120").then(function (r) {
-        box.textContent = (r.ok && r.text) ? r.text : (r.error || "—");
-        box.scrollTop = box.scrollHeight;
-      });
-    }
-  }
-
-  /* ---------- wiring ---------- */
-  document.addEventListener("DOMContentLoaded", function () {
-    applyLang();
-
-    $("langBtn").addEventListener("click", function () {
-      lang = lang === "fa" ? "en" : "fa";
-      localStorage.setItem(LS_LANG, lang);
-      applyLang();
-    });
-
-    $("primaryBtn").addEventListener("click", function () {
-      var st = state.status || {};
-      if (st.state === "connected") disconnect();
-      else {
-        var first = null;
-        if (state.status && state.status.location) first = state.status.location.key;
-        if (!first && state.locations && state.locations.items && state.locations.items.length) first = state.locations.items[0].key;
-        if (first) connect(first, 0, null); else toast(t("empty"), "err");
-      }
-    });
-
-    $("testBtn").addEventListener("click", selftest);
-    $("refreshBtn").addEventListener("click", refreshFeed);
-    $("refreshTop").addEventListener("click", refreshFeed);
-    $("search").addEventListener("input", function (e) { state.filter = e.target.value; renderLocations(); });
-    $("settingsBtn").addEventListener("click", function () { $("setErr").hidden = true; $("drawer").hidden = false; loadSettings(); });
-    $("drawerClose").addEventListener("click", function () { $("drawer").hidden = true; });
-    $("drawer").addEventListener("click", function (e) { if (e.target === $("drawer")) $("drawer").hidden = true; });
-    $("saveSettings").addEventListener("click", saveSettings);
-    $("cfgTokenGen").addEventListener("click", function () {
-      var a = new Uint8Array(16);
-      (window.crypto || window.msCrypto).getRandomValues(a);
-      $("cfgToken").value = Array.prototype.map.call(a, function (b) { return ("0" + b.toString(16)).slice(-2); }).join("");
-    });
-    $("panicBtn").addEventListener("click", function () { $("drawer").hidden = true; disconnect(); });
-    $("logToggle").addEventListener("click", function () { toggleLog(); });
-    $("sourceBtn").addEventListener("click", openSource);
-    $("srvClose").addEventListener("click", function () { $("serverModal").hidden = true; });
-    $("serverModal").addEventListener("click", function (e) {
-      if (e.target === $("serverModal")) $("serverModal").hidden = true;
-    });
-    $("srcClose").addEventListener("click", function () { $("sourceModal").hidden = true; });
-    $("srcCloseBtn").addEventListener("click", function () { $("sourceModal").hidden = true; });
-    $("sourceModal").addEventListener("click", function (e) {
-      if (e.target === $("sourceModal")) $("sourceModal").hidden = true;
-    });
-
-    $("gateForm").addEventListener("submit", function (e) {
-      e.preventDefault();
-      var v = $("tokenInput").value.trim();
-      if (!v) return;
-      state.token = v;
-      localStorage.setItem(LS_TOKEN, v);
-      setCookie(v);
-      api("status").then(function (r) {
-        if (r.unauthorized) {
-          state.token = "";
-          localStorage.removeItem(LS_TOKEN);
-          dropCookie();
-          $("gateErr").hidden = false;
-          $("gateErr").textContent = t("badToken");
-          return;
-        }
-        $("gate").hidden = true;
-        boot();
-      });
-    });
-
-    function boot() {
-      loadSettings();
-      loadStatus().then(function (r) {
-        if (r.unauthorized) return;
-        loadLocations(false);
-      });
-      if (state.timer) clearInterval(state.timer);
-      state.timer = setInterval(function () {
-        if (document.hidden) return;
-        if (!state.busy) loadStatus();
-        if (!$("logBox").hidden) toggleLog(true);
-      }, 3000);
-    }
-
-    if (!state.token) openGate();
-    else { setCookie(state.token); boot(); }
   });
+  $("gate-token").addEventListener("keydown", function (e) { if (e.key === "Enter") $("gate-go").click(); });
+
+  // ---------------------------------------------------------------- status
+  function renderStatus() {
+    var s = state.status || { state: "idle" };
+    var dot = $("conn-dot");
+    dot.className = "dot " + (s.state === "connected" ? "ok" : s.state === "connecting" ? "wait" : s.state === "error" ? "bad" : "");
+    $("conn-label").textContent = t(s.state) || s.state;
+    $("st-name").textContent = s.name || "No tunnel";
+    var sub = [];
+    if (s.type_label) sub.push(s.type_label);
+    if (s.server) sub.push(s.server);
+    if (s.iface) sub.push(s.iface);
+    $("st-sub").textContent = sub.join("  ·  ");
+    $("st-ip").textContent = s.exit_ip || "-";
+    $("st-vip").textContent = s.vip || "-";
+    $("st-up").textContent = dur(s.uptime);
+    $("st-rx").textContent = (s.rx || s.tx) ? byteStr(s.rx) + " / " + byteStr(s.tx) : "-";
+    var warn = $("st-warn");
+    var msg = s.error || s.warning || s.degraded || "";
+    if (msg) { warn.textContent = msg; warn.className = "warn"; } else { warn.className = "warn hidden"; }
+    $("btn-disconnect").disabled = !s.conn_id;
+  }
+
+  function poll() {
+    api("status").then(function (r) {
+      if (!r.ok) return;
+      state.status = r.status;
+      renderStatus();
+      var fast = r.status.state === "connecting";
+      setTimeout(poll, fast ? 2500 : 9000);
+    }).catch(function () { setTimeout(poll, 15000); });
+  }
+
+  // ------------------------------------------------------------ connection
+  function connCard(c) {
+    var box = el("div", "card conn" + (c.active && c.up ? " live" : ""));
+    var head = el("div", "conn-head");
+    var left = el("div", "conn-title");
+    left.appendChild(el("span", "badge", c.type_label || c.type));
+    left.appendChild(el("span", "name", c.name));
+    head.appendChild(left);
+    var dot = el("span", "dot " + (c.active && c.up ? "ok" : c.active ? "wait" : ""));
+    head.appendChild(dot);
+    box.appendChild(head);
+
+    var meta = [];
+    if (c.endpoint) meta.push(c.endpoint);
+    if (c.vip) meta.push(c.vip);
+    box.appendChild(el("div", "muted small", meta.join("  ·  ")));
+    if (c.degraded) box.appendChild(el("div", "warn small", c.degraded));
+
+    var acts = el("div", "conn-acts");
+    if (c.active && c.up) {
+      var off = el("button", "btn danger small", t("disconnect"));
+      off.onclick = function () { busy(off, api("disconnect", {}).then(refreshAll)); };
+      acts.appendChild(off);
+    } else {
+      var on = el("button", "btn primary small", t("connect"));
+      on.onclick = function () { busy(on, api("connection-connect", { id: c.id }).then(function () { setTimeout(refreshAll, 600); })); };
+      acts.appendChild(on);
+    }
+    var test = el("button", "btn ghost small", t("test"));
+    test.onclick = function () {
+      busy(test, api("connection-test", { id: c.id }).then(function (r) {
+        if (r.ok) toast("exit " + (r.exit_ip || "?") + " - ok");
+        else toast(r.error || r.detail || "test failed", true);
+        refreshAll();
+      }));
+    };
+    acts.appendChild(test);
+    var edit = el("button", "btn ghost small", t("edit"));
+    edit.onclick = function () { openModal(c.type, c); };
+    acts.appendChild(edit);
+    var del = el("button", "btn ghost small danger-text", t("delete"));
+    del.onclick = function () {
+      if (!confirm(t("confirm_delete"))) return;
+      busy(del, api("connections-delete", { id: c.id }).then(refreshAll));
+    };
+    acts.appendChild(del);
+    box.appendChild(acts);
+    return box;
+  }
+
+  function busy(btn, promise) {
+    var old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "...";
+    return promise.catch(function (e) { toast("" + (e.message || e), true); })
+      .then(function () { btn.disabled = false; btn.textContent = old; });
+  }
+
+  function renderConns() {
+    var box = $("conn-list");
+    box.innerHTML = "";
+    state.conns.forEach(function (c) { box.appendChild(connCard(c)); });
+    $("conn-empty").classList.toggle("hidden", state.conns.length > 0);
+  }
+
+  function renderDeps() {
+    var m = (state.caps && state.caps.missing) || { types: [], packages: [] };
+    var box = $("deps");
+    if (!m.types || !m.types.length) { box.className = "deps hidden"; return; }
+    box.className = "deps";
+    box.innerHTML = "";
+    box.appendChild(el("span", "", t("deps_missing") + " " + m.types.map(function (x) { return TYPES[x] ? TYPES[x].label : x; }).join(", ")));
+    var btn = el("button", "btn primary small", t("install_deps"));
+    btn.onclick = function () {
+      busy(btn, api("deps-install", {}).then(function (r) {
+        toast(r.ok ? "installed" : "still missing: " + (r.missing_types || []).join(", "), !r.ok);
+        refreshAll();
+      }));
+    };
+    box.appendChild(btn);
+  }
+
+  // ------------------------------------------------------------------ feed
+  function renderFeed() {
+    var q = ($("feed-search").value || "").toLowerCase();
+    var box = $("feed-list");
+    box.innerHTML = "";
+    var items = state.feed.filter(function (it) {
+      return !q || (it.title + " " + it.country + " " + it.key).toLowerCase().indexOf(q) >= 0;
+    });
+    items.forEach(function (it) {
+      var c = el("div", "card feed");
+      var row = el("div", "row between");
+      var left = el("div", "row gap");
+      left.appendChild(el("span", "flag", it.flag || ""));
+      var meta = el("div");
+      meta.appendChild(el("div", "name", it.title + (it.country ? " · " + it.country : "")));
+      meta.appendChild(el("div", "muted small", it.servers.length + " server(s)" + (it.premium ? " · premium" : "")));
+      left.appendChild(meta);
+      row.appendChild(left);
+      var btn = el("button", "btn ghost small", t("connect"));
+      btn.onclick = function () { busy(btn, api("connect", { key: it.key, index: 0 }).then(function () { setTimeout(refreshAll, 600); })); };
+      row.appendChild(btn);
+      c.appendChild(row);
+      box.appendChild(c);
+    });
+    $("feed-empty").classList.toggle("hidden", items.length > 0);
+  }
+
+  // ---------------------------------------------------------------- modal
+  function openModal(type, conn) {
+    state.editing = conn || null;
+    state.type = type || (conn && conn.type) || "ikev2";
+    $("m-title").textContent = conn ? t("edit") : t("add");
+    $("m-msg").textContent = "";
+    $("modal").classList.remove("hidden");
+    renderTypes();
+    renderForm();
+  }
+  function closeModal() { $("modal").classList.add("hidden"); state.editing = null; }
+
+  function renderTypes() {
+    var box = $("m-types");
+    box.innerHTML = "";
+    Object.keys(TYPES).forEach(function (k) {
+      var b = el("button", "type" + (k === state.type ? " active" : ""));
+      b.appendChild(el("span", "type-name", TYPES[k].label));
+      b.appendChild(el("span", "type-hint", TYPES[k].hint));
+      b.onclick = function () { state.type = k; renderTypes(); renderForm(); };
+      box.appendChild(b);
+    });
+  }
+
+  function renderForm() {
+    var box = $("m-form");
+    box.className = "form";
+    box.innerHTML = "";
+    var defs = FIELDS[state.type] || [];
+    var conf = (state.editing && state.editing.type === state.type) ? {} : {};
+    var rawCfg = (state.editing && state.editing.config) ? state.editing.config : {};
+
+    var nameRow = el("label", "field");
+    nameRow.appendChild(el("span", "", "Name"));
+    var nameIn = el("input", "");
+    nameIn.id = "f-name";
+    nameIn.value = (state.editing && state.editing.name) || "";
+    nameIn.placeholder = TYPES[state.type].label;
+    nameRow.appendChild(nameIn);
+    box.appendChild(nameRow);
+
+    defs.forEach(function (f) {
+      var wrap = el("label", "field");
+      wrap.appendChild(el("span", "", f.label));
+      var inp;
+      if (f.area) {
+        inp = el("textarea", "mono");
+        inp.rows = f.rows || 8;
+        inp.placeholder = f.k === "raw" ? t("paste") : (f.ph || "");
+      } else {
+        inp = el("input", "");
+        inp.type = f.type || "text";
+        if (f.ph) inp.placeholder = f.ph;
+      }
+      inp.id = "f-" + f.k;
+      inp.value = rawCfg[f.k] || "";
+      wrap.appendChild(inp);
+      box.appendChild(wrap);
+    });
+    box.appendChild(el("div", "muted small", "ssh " + (state.type === "vless" ? "vless://uuid@host:443?security=reality&pbk=...&sid=..." : "")));
+  }
+
+  function collect() {
+    var conf = {};
+    (FIELDS[state.type] || []).forEach(function (f) {
+      var v = $("f-" + f.k);
+      if (v && v.value.trim()) conf[f.k] = v.value.trim();
+    });
+    var body = { type: state.type, name: $("f-name").value.trim(), config: conf, share_lan: true };
+    if (state.editing) body.id = state.editing.id;
+    return body;
+  }
+
+  $("m-save").addEventListener("click", function () {
+    var btn = $("m-save");
+    busy(btn, api("connections-save", collect()).then(function (r) {
+      if (!r.ok) { $("m-msg").textContent = r.error || "error"; return; }
+      if (r.valid === false) { $("m-msg").textContent = r.error || "invalid"; }
+      closeModal();
+      refreshAll();
+      toast(t("save") + " ok");
+    }).catch(function (e) { $("m-msg").textContent = "" + (e.message || e); }));
+  });
+  $("m-cancel").addEventListener("click", closeModal);
+  $("m-close").addEventListener("click", closeModal);
+  $("btn-add").addEventListener("click", function () { openModal("ikev2", null); });
+
+  // -------------------------------------------------------------- settings
+  function renderSettings(s) {
+    $("set-share").checked = !!s.share_lan;
+    $("set-v6").checked = !!s.block_ipv6;
+    $("set-auto").checked = !!s.auto_reconnect;
+    $("set-mtu").value = s.tunnel_mtu || 1400;
+    $("set-feed").value = s.feed_url || "";
+    $("ver").textContent = s.version ? "v" + s.version : "";
+  }
+  $("btn-save-settings").addEventListener("click", function () {
+    var btn = $("btn-save-settings");
+    busy(btn, api("settings", {
+      share_lan: $("set-share").checked,
+      block_ipv6: $("set-v6").checked,
+      auto_reconnect: $("set-auto").checked,
+      tunnel_mtu: +$("set-mtu").value || 1400,
+      feed_url: $("set-feed").value.trim() || undefined
+    }).then(function (r) {
+      if (r.ok) { renderSettings(r.settings); toast(t("save") + " ok"); }
+    }));
+  });
+  $("btn-log").addEventListener("click", function () {
+    var pre = $("log");
+    if (!pre.classList.contains("hidden")) { pre.classList.add("hidden"); return; }
+    api("log?lines=80").then(function (r) { pre.textContent = r.text || "(empty)"; pre.classList.remove("hidden"); });
+  });
+
+  // ----------------------------------------------------------------- tabs
+  Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (b) {
+    b.addEventListener("click", function () {
+      Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (x) { x.classList.remove("active"); });
+      Array.prototype.forEach.call(document.querySelectorAll(".tabpane"), function (x) { x.classList.add("hidden"); });
+      b.classList.add("active");
+      $("tab-" + b.dataset.tab).classList.remove("hidden");
+      if (b.dataset.tab === "feed") loadFeed();
+    });
+  });
+
+  $("btn-disconnect").addEventListener("click", function () {
+    busy($("btn-disconnect"), api("disconnect", {}).then(refreshAll));
+  });
+  $("btn-test").addEventListener("click", function () {
+    busy($("btn-test"), api("selftest", {}).then(function (r) {
+      toast(r.ok ? "exit " + (r.result.ip || "?") : (r.result.detail || "failed"), !r.ok);
+      refreshAll();
+    }));
+  });
+  $("btn-refresh").addEventListener("click", function () {
+    busy($("btn-refresh"), api("refresh", {}).then(function (r) {
+      toast(r.ok ? r.count + " locations" : (r.error || "failed"), !r.ok);
+      loadFeed();
+    }));
+  });
+  $("feed-search").addEventListener("input", renderFeed);
+  $("lang").addEventListener("click", function () {
+    lang = lang === "en" ? "fa" : "en";
+    localStorage.setItem(LS_LANG, lang);
+    document.documentElement.lang = lang;
+    document.documentElement.dir = lang === "fa" ? "rtl" : "ltr";
+    $("lang").textContent = lang === "en" ? "FA" : "EN";
+    document.querySelectorAll("[data-i18n]").forEach(function (n) {
+      var k = n.getAttribute("data-i18n");
+      if (k) n.textContent = t(k);
+    });
+    refreshAll();
+  });
+
+  // ------------------------------------------------------------------ boot
+  function loadFeed() {
+    api("locations").then(function (r) {
+      if (!r.ok) return;
+      state.feed = r.items || [];
+      renderFeed();
+    });
+  }
+
+  function refreshAll() {
+    return Promise.all([
+      api("status").then(function (r) { if (r.ok) { state.status = r.status; renderStatus(); } }),
+      api("connections").then(function (r) { if (r.ok) { state.conns = r.items || []; renderConns(); } }),
+      api("caps").then(function (r) { if (r.ok) { state.caps = { caps: r.caps, missing: r.missing }; renderDeps(); } }),
+      api("settings").then(function (r) { if (r.ok) renderSettings(r.settings); })
+    ]).catch(function () { });
+  }
+
+  function boot() {
+    document.documentElement.lang = lang;
+    document.documentElement.dir = lang === "fa" ? "rtl" : "ltr";
+    $("lang").textContent = lang === "en" ? "FA" : "EN";
+    refreshAll().then(function () { loadFeed(); poll(); setInterval(refreshAll, 20000); });
+  }
+
+  if (state.token) {
+    document.cookie = "vpnexit=" + encodeURIComponent(state.token) + "; path=/; max-age=31536000; SameSite=Strict";
+    $("app").classList.remove("hidden");
+    boot();
+  } else {
+    askToken();
+  }
 })();

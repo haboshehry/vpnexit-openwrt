@@ -1,10 +1,11 @@
 #!/usr/bin/ucode
-// vpnexit - IKEv2 exit switcher and LAN sharing controller for OpenWrt.
+// vpnexit - multi-protocol VPN exit controller for OpenWrt.
 //
-// The daemon side is deliberately small: it renders swanctl configuration,
-// starts/tears down one CHILD_SA and installs a handful of nftables/ip rules.
-// It never touches the system default route, so the router itself keeps using
-// its own uplink while LAN clients are steered through the tunnel.
+// One panel, one routing engine.  Any configured tunnel - feed IKEv2, manual
+// IKEv2, L2TP/IPsec, SSTP, OpenVPN, WireGuard, AmneziaWG or VLESS/REALITY -
+// is brought up by its own driver and then shared with the LAN through the
+// same nftables mark + policy route.  The system default route is never
+// modified, so the router keeps its own uplink and stays reachable.
 
 const fs = require("fs");
 const uci = require("uci");
@@ -15,13 +16,19 @@ const LOGFILE = RUN + "/log";
 const STATE = RUN + "/state.json";
 const LOCS = DATA + "/locations.json";
 const CHAINS = DATA + "/chains";
+const CONNFILE = DATA + "/connections.json";
+const RUNDIR = DATA + "/run";
 const SWANCTL_CONF = "/etc/swanctl/conf.d/vpnexit.conf";
 const SWANCTL_SECRETS = "/etc/swanctl/conf.d/vpnexit-secrets.conf";
 const CONN = "vpnexit";
 const CHILD = "vpnexit";
 const PROBE = "https://1.1.1.1/cdn-cgi/trace";
 
-// ---------------------------------------------------------------- utilities
+const WGIFACE = "vpnwg0";
+const OVPNIFACE = "ovpnx0";
+const VLESSIFACE = "vpnvl0";
+
+// ------------------------------------------------------------------ utilities
 
 function now() { return time(); }
 
@@ -59,6 +66,17 @@ function urldecode(s) {
 			if (hi >= 0 && lo >= 0) { out += chr(hi * 16 + lo); i += 2; continue; }
 		}
 		out += ch;
+	}
+	return out;
+}
+
+function urlencode(s) {
+	s = "" + (s ?? "");
+	let out = "";
+	for (let i = 0; i < length(s); i++) {
+		let ch = substr(s, i, 1);
+		if (match(ch, /[A-Za-z0-9._~-]/)) { out += ch; continue; }
+		out += sprintf("%%%02X", ord(ch));
 	}
 	return out;
 }
@@ -108,6 +126,8 @@ function first_word(v) {
 	let p = split(trim("" + (v ?? "")), " ");
 	return p[0] ?? "";
 }
+
+function has_bin(path) { return fs.stat(path) != null; }
 
 // ------------------------------------------------------------------- config
 
@@ -185,9 +205,53 @@ function default_route() {
 }
 
 function iface_cidr(dev) {
+	if (!length(dev)) return "";
 	let r = run("ip -4 -o addr show dev " + shellq(dev));
 	let m = match(r.out, /inet\s+([0-9.]+\/[0-9]+)/);
 	return m ? m[1] : "";
+}
+
+function iface_exists(dev) {
+	if (!length(dev)) return false;
+	return fs.stat("/sys/class/net/" + dev) != null;
+}
+
+function net_list() {
+	let out = [];
+	let r = run("ls /sys/class/net");
+	for (let n in split(trim(r.out), "\n")) if (length(trim(n))) push(out, trim(n));
+	return out;
+}
+
+function ppp_ifaces() {
+	let out = [];
+	for (let n in net_list()) if (index(n, "ppp") == 0) push(out, n);
+	return out;
+}
+
+function new_iface_since(before) {
+	for (let n in ppp_ifaces()) {
+		let seen = false;
+		for (let b in before) if (b == n) seen = true;
+		if (!seen) return n;
+	}
+	return "";
+}
+
+function iface_v4(dev) {
+	if (!length(dev)) return "";
+	let r = run("ip -4 -o addr show dev " + shellq(dev));
+	// Point-to-point devices (tun, ppp) print "inet 10.8.0.6 peer 10.8.0.5/32":
+	// the prefix belongs to the peer, so the address must be matched on its own.
+	let m = match(r.out, /inet\s+([0-9.]+)(\/|\s)/);
+	return m ? m[1] : "";
+}
+
+function iface_bytes(dev) {
+	if (!length(dev)) return { rx: 0, tx: 0 };
+	let rx = intval(trim(readfile("/sys/class/net/" + dev + "/statistics/rx_bytes")), 0);
+	let tx = intval(trim(readfile("/sys/class/net/" + dev + "/statistics/tx_bytes")), 0);
+	return { rx: rx, tx: tx };
 }
 
 function lan_iface() {
@@ -217,6 +281,19 @@ function mask4(cidr) {
 	let b = int(host / 65536); host -= b * 65536;
 	let c = int(host / 256); host -= c * 256;
 	return sprintf("%d.%d.%d.%d/%d", a, b, c, host, bits);
+}
+
+function resolve4(host) {
+	if (match(host ?? "", /^[0-9.]+$/)) return host;
+	let r = run("nslookup " + shellq(host));
+	let out = [];
+	for (let line in split(r.out, "\n")) {
+		let m = match(line, /Address:\s*([0-9.]+)/);
+		if (!m) continue;
+		if (index(out, m[1]) < 0) push(out, m[1]);
+		if (length(out) >= 4) break;
+	}
+	return length(out) ? out[0] : "";
 }
 
 // ---------------------------------------------------------------- swanctl io
@@ -377,18 +454,6 @@ function url_host(url) {
 	return m ? m[1] : "";
 }
 
-function resolve4(host) {
-	let r = run("nslookup " + shellq(host));
-	let out = [];
-	for (let line in split(r.out, "\n")) {
-		let m = match(line, /Address:\s*([0-9.]+)/);
-		if (!m) continue;
-		if (index(out, m[1]) < 0) push(out, m[1]);
-		if (length(out) >= 4) break;
-	}
-	return out;
-}
-
 // Some ISPs answer a TLS reset for the feed host. When the tunnel is up the same
 // request succeeds through it, so the marked path is used as a fallback.
 function fetch_via_tunnel(url, outfile) {
@@ -400,11 +465,10 @@ function fetch_via_tunnel(url, outfile) {
 	run("nft delete table inet vxprobe");
 	run("nft add table inet vxprobe");
 	run("nft add chain inet vxprobe out '{ type route hook output priority mangle; policy accept; }'");
-	for (let ip in ips)
-		run(sprintf("nft add rule inet vxprobe out ip daddr %s meta mark set %s", ip, mark));
+	run(sprintf("nft add rule inet vxprobe out ip daddr %s meta mark set %s", ips, mark));
 	let r = run(sprintf("uclient-fetch -q -O %s --timeout=30 %s", shellq(outfile), shellq(url)));
 	run("nft delete table inet vxprobe");
-	log(sprintf("refresh: tried %d address(es) through the tunnel, rc=%d", length(ips), r.rc));
+	log(sprintf("refresh: tried %s through the tunnel, rc=%d", ips, r.rc));
 	return r;
 }
 
@@ -509,7 +573,7 @@ function learn_chain(host) {
 		log("trust: no TLS chain for " + host);
 		return false;
 	}
-	let blocks = [], tail = "";
+	let blocks = [];
 	for (let part in split(r.out, "-----END CERTIFICATE-----")) {
 		let s = index(part, "-----BEGIN CERTIFICATE-----");
 		if (s >= 0) push(blocks, substr(part, s) + "-----END CERTIFICATE-----\n");
@@ -544,9 +608,14 @@ const IKE_PROPOSALS = "aes256-sha256-modp2048,aes128-sha256-modp2048,aes256-sha1
 // an AEAD attribute that some vendor kernels handle badly.
 const ESP_PROPOSALS = "aes256-sha256,aes128-sha256,aes256-sha1,aes128-sha1";
 
-function conn_text(srv) {
+function swan_quote(v) { return "\"" + replace("" + (v ?? ""), /["\\]/g, function (m) { return "\\" + m; }) + "\""; }
+
+// IKEv2, either EAP-MSCHAPv2 with a server certificate or a pre-shared key.
+function conn_text_ikev2(srv) {
 	let addr = length(srv.ip) ? srv.ip : srv.host;
-	let ident = length(srv.local_id) ? srv.local_id : srv.user;
+	let remote_id = length(srv.remote_id) ? srv.remote_id : srv.host;
+	let local_id = length(srv.local_id) ? srv.local_id : srv.user;
+	let psk = length(srv.psk ?? "") > 0;
 	let lines = [
 		"# Managed by vpnexit - regenerated on every switch.",
 		"connections {",
@@ -556,13 +625,13 @@ function conn_text(srv) {
 		"    remote_addrs = " + addr,
 		"    proposals = " + IKE_PROPOSALS,
 		"    local {",
-		"      auth = eap-mschapv2",
-		"      id = " + ident,
-		"      eap_id = " + srv.user,
+		psk ? "      auth = psk" : "      auth = eap-mschapv2",
+		"      id = " + swan_quote(local_id),
+		psk ? "" : "      eap_id = " + swan_quote(srv.user),
 		"    }",
 		"    remote {",
-		"      auth = pubkey",
-		"      id = " + srv.host,
+		psk ? "      auth = psk" : "      auth = pubkey",
+		"      id = " + swan_quote(remote_id),
 		"    }",
 		"    vips = 0.0.0.0",
 		"    dpd_delay = 30s",
@@ -581,28 +650,83 @@ function conn_text(srv) {
 		"}",
 		""
 	];
+	let out = [];
+	for (let l in lines) if (length(l)) push(out, l);
+	return join("\n", out);
+}
+
+// L2TP over IPsec: IKEv1 in transport mode, UDP/1701 only. xl2tpd then runs
+// PPP inside the transport SA and produces a pppN interface.
+function conn_text_l2tp(srv) {
+	let addr = length(srv.ip) ? srv.ip : srv.host;
+	let lines = [
+		"# Managed by vpnexit - L2TP/IPsec transport (regenerated on every switch).",
+		"connections {",
+		"  " + CONN + " {",
+		"    version = 1",
+		"    local_addrs = %any",
+		"    remote_addrs = " + addr,
+		"    proposals = aes256-sha1-modp2048,aes128-sha1-modp1024,3des-sha1-modp1024",
+		"    local {",
+		"      auth = psk",
+		"      id = %any",
+		"    }",
+		"    remote {",
+		"      auth = psk",
+		"      id = %any",
+		"    }",
+		"    children {",
+		"      " + CHILD + " {",
+		"        mode = transport",
+		"        local_ts = dynamic[udp/1701]",
+		"        remote_ts = dynamic[udp/1701]",
+		"        esp_proposals = aes256-sha1,aes128-sha1,3des-sha1",
+		"        start_action = trap",
+		"        dpd_action = restart",
+		"        close_action = none",
+		"      }",
+		"    }",
+		"  }",
+		"}",
+		""
+	];
 	return join("\n", lines);
 }
 
 function secrets_text(srv) {
-	let esc = replace("" + (srv.pass ?? ""), /[\\"]/g, function (m) { return "\\" + m; });
-	let lines = ["secrets {", "  eap-" + CONN + " {"];
-	push(lines, "    id = " + (length(srv.local_id) ? srv.local_id : srv.user));
-	push(lines, "    secret = \"" + esc + "\"");
-	if (length(srv.local_id) && srv.local_id != srv.user) {
+	let psk = srv.psk ?? "";
+	let lines = ["secrets {"];
+	if (length(psk)) {
+		push(lines, "  ike-" + CONN + " {");
+		push(lines, "    id = " + swan_quote(length(srv.remote_id) ? srv.remote_id : (srv.host ?? "")));
+		push(lines, "    secret = " + swan_quote(psk));
+		if (length(srv.host) && srv.remote_id && srv.remote_id != srv.host) {
+			push(lines, "  }");
+			push(lines, "  ike-" + CONN + "2 {");
+			push(lines, "    id = " + swan_quote(srv.host));
+			push(lines, "    secret = " + swan_quote(psk));
+		}
 		push(lines, "  }");
-		push(lines, "  eap-" + CONN + "2 {");
-		push(lines, "    id = " + srv.user);
+	} else {
+		let esc = replace("" + (srv.pass ?? ""), /[\\"]/g, function (m) { return "\\" + m; });
+		push(lines, "  eap-" + CONN + " {");
+		push(lines, "    id = " + swan_quote(length(srv.local_id) ? srv.local_id : srv.user));
 		push(lines, "    secret = \"" + esc + "\"");
+		if (length(srv.local_id) && srv.local_id != srv.user) {
+			push(lines, "  }");
+			push(lines, "  eap-" + CONN + "2 {");
+			push(lines, "    id = " + swan_quote(srv.user));
+			push(lines, "    secret = \"" + esc + "\"");
+		}
+		push(lines, "  }");
 	}
-	push(lines, "  }");
 	push(lines, "}");
 	return join("\n", lines) + "\n";
 }
 
 function write_conn(srv) {
 	ensure_dir("/etc/swanctl/conf.d");
-	writefile(SWANCTL_CONF, conn_text(srv), "0644");
+	writefile(SWANCTL_CONF, srv.l2tp ? conn_text_l2tp(srv) : conn_text_ikev2(srv), "0644");
 	writefile(SWANCTL_SECRETS, secrets_text(srv), "0600");
 }
 
@@ -611,28 +735,831 @@ function clear_conn_files() {
 	if (fs.stat(SWANCTL_SECRETS)) fs.unlink(SWANCTL_SECRETS);
 }
 
-// ---------------------------------------------------------------- routing
+// -------------------------------------------------------- connection store
+
+const TYPES = ["ikev2", "l2tp", "sstp", "openvpn", "wireguard", "amneziawg", "vless"];
+
+function type_label(t) {
+	let m = {
+		ikev2: "IKEv2", l2tp: "L2TP/IPsec", sstp: "SSTP", openvpn: "OpenVPN",
+		wireguard: "WireGuard", amneziawg: "AmneziaWG", vless: "VLESS / REALITY"
+	};
+	return m[t] ?? t;
+}
+
+// Which client binaries are present.  The panel turns the false entries into
+// one-click installs instead of letting a connect fail with "not found".
+function caps() {
+	return {
+		ikev2: has_bin("/usr/sbin/swanctl") && has_bin("/usr/sbin/charon") || has_bin("/usr/sbin/swanctl"),
+		l2tp: has_bin("/usr/sbin/xl2tpd") && has_bin("/usr/sbin/swanctl") && has_bin("/usr/sbin/pppd"),
+		sstp: has_bin("/usr/bin/sstpc") && has_bin("/usr/sbin/pppd"),
+		openvpn: has_bin("/usr/sbin/openvpn"),
+		wireguard: has_bin("/usr/bin/wg"),
+		amneziawg: has_bin("/usr/bin/awg") || has_bin("/usr/bin/wg"),
+		vless: has_bin("/usr/bin/sing-box")
+	};
+}
+
+const PKG_FOR_TYPE = {
+	ikev2: "strongswan-charon strongswan-swanctl strongswan-mod-eap-mschapv2 strongswan-mod-pem strongswan-mod-openssl",
+	l2tp: "strongswan-charon strongswan-swanctl xl2tpd kmod-l2tp ppp-mod-pppol2tp",
+	sstp: "sstp-client ppp",
+	openvpn: "openvpn-openssl",
+	wireguard: "wireguard-tools kmod-wireguard",
+	amneziawg: "wireguard-tools kmod-wireguard",
+	vless: "sing-box"
+};
+
+function missing_packages() {
+	let need = [];
+	let c = caps();
+	for (let t in TYPES) if (!c[t]) push(need, t);
+	let out = [];
+	for (let t in need) for (let p in split(PKG_FOR_TYPE[t] ?? "", " ")) if (length(p)) {
+		if (index(out, p) < 0) push(out, p);
+	}
+	return { types: need, packages: out };
+}
+
+function conns_load() {
+	let raw = readfile(CONNFILE);
+	if (length(raw)) {
+		try {
+			let d = json(raw);
+			if (type(d) == "object" && d != null && type(d.items) == "array") return d;
+		} catch (e) { }
+	}
+	return { items: [], active: "" };
+}
+
+function conns_save(doc) {
+	ensure_dir(DATA);
+	fs.writefile(CONNFILE, sprintf("%J", doc));
+	run("chmod 600 " + shellq(CONNFILE));
+	return doc;
+}
+
+function find_conn(id) {
+	for (let c in conns_load().items) if (c.id == id) return c;
+	return null;
+}
+
+function new_id() {
+	let r = run("dd if=/dev/urandom bs=8 count=1 2>/dev/null | md5sum");
+	let h = trim(r.out);
+	if (length(h) < 8) h = sprintf("%08x%s", now(), "");
+	return substr(h, 0, 8);
+}
+
+function conn_runtime_dir(id) {
+	let d = RUNDIR + "/" + replace(id ?? "", /[^A-Za-z0-9_-]/g, "_");
+	ensure_dir(d);
+	run("chmod 700 " + shellq(d));
+	return d;
+}
+
+function conn_endpoint(c) {
+	let s = c.config ?? {};
+	if (c.type == "vless") return (s.host ?? "") + ":" + (s.port ?? 443);
+	if (c.type == "wireguard" || c.type == "amneziawg") return s.endpoint ?? "";
+	if (length(s.server ?? "")) return s.server + (length(s.port ?? "") ? ":" + s.port : "");
+	return s.host ?? "";
+}
+
+// A feed location is exposed to the same connect path as a manual connection:
+// it is materialised as an IKEv2 connection with a candidate server list.
+function loc_conn(key, index) {
+	let loc = find_location(key);
+	if (loc == null) return null;
+	let idx = intval(index, 0);
+	if (idx < 0 || idx >= length(loc.servers)) idx = 0;
+	let s = loc.servers[idx];
+	return {
+		id: "loc:" + key + ":" + idx,
+		type: "ikev2",
+		name: loc.title + (length(loc.country) ? " (" + loc.country + ")" : ""),
+		flag: loc.flag,
+		source: "feed",
+		config: {
+			server: s.host, ip: s.ip, username: s.user, password: s.pass,
+			local_id: s.local_id, remote_id: s.host
+		},
+		candidates: loc.servers
+	};
+}
+
+function resolve_target(id) {
+	if (index(id ?? "", "loc:") == 0) {
+		let p = split(id, ":");
+		return loc_conn(p[1] ?? "", intval(p[2], 0));
+	}
+	return find_conn(id);
+}
+
+// ------------------------------------------------------------------ parsers
+// One tiny INI reader covers WireGuard/AmneziaWG configuration files, which is
+// also the format Amnezia exports for its WireGuard-based protocols.
+function ini_parse(text) {
+	let out = [], cur = null;
+	for (let raw in split(replace(text ?? "", /\r/g, ""), "\n")) {
+		let line = trim(replace(raw, /(^|\s)#.*$/, ""));
+		if (!length(line)) continue;
+		let m = match(line, /^\[(.+)\]$/);
+		if (m) { cur = { section: lc(trim(m[1])), kv: {} }; push(out, cur); continue; }
+		let i = index(line, "=");
+		if (i <= 0) continue;
+		if (cur == null) { cur = { section: "", kv: {} }; push(out, cur); }
+		cur.kv[lc(trim(substr(line, 0, i)))] = trim(substr(line, i + 1));
+	}
+	return out;
+}
+
+function wg_parse(text) {
+	let blocks = ini_parse(text);
+	let res = { iface: {}, peers: [], error: "" };
+	for (let b in blocks) {
+		if (b.section == "interface") {
+			for (let k in b.kv) res.iface[k] = b.kv[k];
+		} else if (b.section == "peer") {
+			push(res.peers, b.kv);
+		}
+	}
+	if (!length(res.iface.privatekey ?? "")) res.error = "the configuration has no [Interface] PrivateKey";
+	else if (!length(res.peers)) res.error = "the configuration has no [Peer] section";
+	return res;
+}
+
+// "172.16.0.2/32, fd00::2/128" -> [{addr, family}]
+function split_addresses(v) {
+	let out = [];
+	for (let part in split(v ?? "", ",")) {
+		part = trim(part);
+		if (!length(part)) continue;
+		push(out, part);
+	}
+	return out;
+}
+
+function vless_parse(uri) {
+	uri = trim(uri ?? "");
+	if (index(uri, "vless://") != 0) return { error: "not a vless:// URL" };
+	let rest = substr(uri, 8);
+	let hash = index(rest, "#");
+	if (hash >= 0) rest = substr(rest, 0, hash);
+	let q = index(rest, "?");
+	let main = q >= 0 ? substr(rest, 0, q) : rest;
+	let query = q >= 0 ? substr(rest, q + 1) : "";
+	let at = index(main, "@");
+	if (at <= 0) return { error: "URL has no uuid@host" };
+	let uuid = substr(main, 0, at);
+	let hostport = substr(main, at + 1);
+	let host = hostport, port = 443;
+	// IPv6 literals keep their brackets.
+	if (match(hostport, /^\[/)) {
+		let close = index(hostport, "]");
+		if (close > 0) {
+			host = substr(hostport, 0, close + 1);
+			if (substr(hostport, close + 1, 1) == ":") port = intval(substr(hostport, close + 2), 443);
+		}
+	} else {
+		let colon = rindex(hostport, ":");
+		if (colon > 0) { host = substr(hostport, 0, colon); port = intval(substr(hostport, colon + 1), 443); }
+	}
+	let p = {};
+	for (let kv in split(query, "&")) {
+		if (!length(kv)) continue;
+		let i = index(kv, "=");
+		if (i < 0) continue;
+		p[lc(substr(kv, 0, i))] = urldecode(substr(kv, i + 1));
+	}
+	host = replace(replace(host, /^\[/, ""), /\]$/, "");
+	if (!length(uuid) || !length(host)) return { error: "URL is missing the uuid or the host" };
+	return {
+		uuid: uuid, host: host, port: port,
+		flow: p.flow ?? "", security: p.security ?? "none", sni: p.sni ?? p.host ?? host,
+		fp: p.fp ?? "chrome", pbk: p.pbk ?? "", sid: p.sid ?? "", spx: p.spx ?? "/",
+		net: p.type ?? "tcp", path: p.path ?? "/", host_header: p.host ?? "",
+		service: p.serviceName ?? "", alpn: p.alpn ?? "", allow_insecure: boolval(p.allowinsecure, false),
+		raw: uri
+	};
+}
+
+// Minimal .ovpn inspection: the panel shows the endpoint before connecting.
+function ovpn_summary(text) {
+	let remote = "", proto = "udp", port = 1194, dev = "tun";
+	for (let raw in split(replace(text ?? "", /\r/g, ""), "\n")) {
+		let line = trim(raw);
+		if (!length(line) || substr(line, 0, 1) == "#" || substr(line, 0, 1) == ";") continue;
+		let f = split(line, " ");
+		if (f[0] == "remote" && !length(remote)) { remote = f[1] ?? ""; if (f[2]) port = intval(f[2], port); }
+		if (f[0] == "proto" && f[1]) proto = lc(f[1]);
+		if (f[0] == "dev" && f[1]) dev = f[1];
+	}
+	return { remote: remote, port: port, proto: proto, dev: dev };
+}
+
+// ------------------------------------------------------------------ drivers
+// Every driver implements the same four calls, so the panel and the watchdog
+// never need to know which protocol is active.
+
+function wait_child(seconds) {
+	for (let i = 0; i < seconds; i++) {
+		let s = sas_parse();
+		if (s.child) return s;
+		sleep(1000);
+	}
+	return sas_parse();
+}
+
+function swan_stop() {
+	run("swanctl --terminate --ike " + CONN);
+	for (let i = 0; i < 6; i++) {
+		let q = sas_parse();
+		if (!q.ike && !q.child) break;
+		sleep(500);
+	}
+}
+
+function kill_pidfile(path) {
+	let pid = intval(trim(readfile(path)), 0);
+	if (pid > 1) {
+		run(sprintf("kill %d 2>/dev/null", pid));
+		sleep(400);
+		run(sprintf("kill -9 %d 2>/dev/null", pid));
+	}
+	if (fs.stat(path)) fs.unlink(path);
+}
+
+// Kill processes whose command line contains $pattern.  BusyBox on this
+// firmware ships pgrep and killall but no pkill, and matching on the command
+// line keeps us from touching an unrelated instance of the same daemon.
+function kill_match(pattern) {
+	let r = run(sprintf("ps w | grep -F %s | grep -v grep | awk '{print $1}'", shellq(pattern)));
+	for (let line in split(trim(r.out), "\n")) {
+		let pid = intval(trim(line), 0);
+		if (pid > 1) run(sprintf("kill %d 2>/dev/null", pid));
+	}
+	return true;
+}
+
+// Start a long running client in its own session so it survives the CGI
+// request that started it, and record its pid for the teardown path.
+function spawn_bg(cmd, logpath, pidpath) {
+	let full = sprintf("setsid sh -c %s >>%s 2>&1 & echo $! > %s",
+		shellq(cmd), shellq(logpath), shellq(pidpath));
+	run("sh -c " + shellq(full));
+	return intval(trim(readfile(pidpath)), 0);
+}
+
+function log_tail(path, lines) {
+	let r = run(sprintf("tail -n %d %s", lines ?? 6, shellq(path)));
+	return trim(r.out);
+}
+
+function wait_iface(name, seconds) {
+	for (let i = 0; i < seconds * 2; i++) {
+		if (iface_exists(name) && length(iface_v4(name))) return true;
+		sleep(500);
+	}
+	return false;
+}
+
+function wait_ppp(before, seconds) {
+	for (let i = 0; i < seconds * 2; i++) {
+		let n = new_iface_since(before);
+		if (length(n) && length(iface_v4(n))) return n;
+		sleep(500);
+	}
+	return new_iface_since(before);
+}
+
+// -------------------------------------------------------------------- IKEv2
+
+function ike_srv(c, alt) {
+	let s = alt ?? c.config;
+	return {
+		host: trim("" + (s.server ?? s.host ?? "")),
+		ip: trim("" + (s.ip ?? "")),
+		user: trim("" + (s.username ?? s.user ?? "")),
+		pass: "" + (s.password ?? s.pass ?? ""),
+		local_id: trim("" + (s.local_id ?? "")),
+		remote_id: trim("" + (s.remote_id ?? "")),
+		psk: "" + (s.psk ?? "")
+	};
+}
+
+function ike_ok(srv) {
+	if (!length(srv.host)) return "server address is required";
+	if (length(srv.psk)) return "";
+	if (!length(srv.user) || !length(srv.pass)) return "username and password are required (or a pre-shared key)";
+	return "";
+}
+
+function ike_prepare(c) {
+	let srv = ike_srv(c);
+	let err = ike_ok(srv);
+	if (length(err)) return { ok: false, error: err };
+	if (!length(srv.psk)) learn_chain(srv.host);
+	write_conn(srv);
+	return { ok: true };
+}
+
+function ike_up(c) {
+	let list = [];
+	if (type(c.candidates) == "array" && length(c.candidates)) {
+		let idx = 0;
+		let cfgp = c.config ?? {};
+		for (let i = 0; i < length(c.candidates); i++) {
+			if ((c.candidates[i].host ?? "") == (cfgp.server ?? "")) idx = i;
+		}
+		for (let k = 0; k < length(c.candidates); k++) push(list, c.candidates[(idx + k) % length(c.candidates)]);
+	} else {
+		push(list, null);
+	}
+	swan_stop();
+	run("swanctl --load-creds");
+	let lastErr = "", used = null, sa = null;
+	for (let i = 0; i < length(list) && i < 3; i++) {
+		let srv = ike_srv(c, list[i] ?? undefined);
+		if (length(ike_ok(srv))) { lastErr = ike_ok(srv); continue; }
+		if (i > 0) log("connect: trying alternate server " + srv.host);
+		if (!length(srv.psk)) learn_chain(srv.host);
+		write_conn(srv);
+		run("swanctl --load-creds");
+		let lc = run("swanctl --load-conns");
+		if (lc.rc != 0) { lastErr = clean(lc.out); continue; }
+		run("swanctl --initiate --child " + CHILD + " --timeout 15");
+		let w = wait_child(10);
+		if (w.child && length(w.vip)) { sa = w; used = srv; break; }
+		lastErr = "peer did not establish a CHILD_SA";
+		run("swanctl --terminate --ike " + CONN);
+	}
+	if (sa == null) {
+		run("swanctl --terminate --ike " + CONN);
+		return { ok: false, error: "IKEv2 handshake failed: " + (clean(lastErr) || "no CHILD_SA") };
+	}
+	return { ok: true, iface: "", vip: sa.vip, remote: sa.remote, xfrm: true, server: used.host };
+}
+
+function ike_down() {
+	swan_stop();
+	clear_conn_files();
+}
+
+function ike_probe() {
+	let s = sas_parse();
+	if (!s.child) return { up: false };
+	return { up: true, iface: "", vip: s.vip, remote: s.remote, rx: s.rx, tx: s.tx, uptime: s.uptime, xfrm: true };
+}
+
+// -------------------------------------------------------------- L2TP/IPsec
+
+function l2tp_prepare(c) {
+	let s = c.config ?? {};
+	let srv = { host: trim("" + (s.server ?? "")), psk: "" + (s.psk ?? ""), l2tp: true };
+	if (!length(srv.host)) return { ok: false, error: "server address is required" };
+	if (!length(srv.psk)) return { ok: false, error: "the IPsec pre-shared key is required" };
+	write_conn(srv);
+	let d = conn_runtime_dir(c.id);
+	let lac = [
+		"[global]",
+		"port = 1701",
+		"access control = no",
+		"",
+		"[lac vpnexit]",
+		"lns = " + srv.host,
+		"name = " + (s.username ?? ""),
+		"pppoptfile = " + d + "/options",
+		"ppp debug = no",
+		"length bit = yes",
+		"redial = no",
+		""
+	];
+	writefile(d + "/xl2tpd.conf", join("\n", lac), "0600");
+	let opts = [
+		"ipcp-accept-local",
+		"ipcp-accept-remote",
+		"noauth",
+		"refuse-eap",
+		"noccp",
+		"mtu " + cfg_int("tunnel_mtu", 1400),
+		"mru " + cfg_int("tunnel_mtu", 1400),
+		"user " + shellq(s.username ?? ""),
+		"password " + shellq(s.password ?? ""),
+		// No "lock" here: OpenWrt's pppd is built without it and refuses the
+		// whole options file ("unrecognized option 'lock'").
+		""
+	];
+	writefile(d + "/options", join("\n", opts), "0600");
+	return { ok: true };
+}
+
+function l2tp_up(c) {
+	let d = conn_runtime_dir(c.id);
+	let before = ppp_ifaces();
+	swan_stop();
+	run("swanctl --load-creds");
+	let lc = run("swanctl --load-conns");
+	if (lc.rc != 0) return { ok: false, error: "cannot load the IPsec connection: " + clean(lc.out) };
+	run("swanctl --initiate --child " + CHILD + " --timeout 15");
+	let sa = wait_child(10);
+	if (!sa.child) return { ok: false, error: "IPsec transport did not come up" };
+
+	run("mkdir -p /var/run/xl2tpd");
+	kill_pidfile(d + "/xl2tpd.pid");
+	kill_match("xl2tpd -c " + d + "/xl2tpd.conf");
+	spawn_bg(sprintf("xl2tpd -c %s -D -p %s", shellq(d + "/xl2tpd.conf"), shellq(d + "/xl2tpd.pid")),
+		d + "/xl2tpd.log", d + "/xl2tpd.pid");
+	sleep(1000);
+	let ctl = "/var/run/xl2tpd/l2tp-control";
+	if (!fs.stat(ctl)) return { ok: false, error: "xl2tpd did not create its control socket" };
+	fs.writefile(ctl, "c vpnexit\n");
+	let dev = wait_ppp(before, 25);
+	if (!length(dev)) {
+		return { ok: false, error: "L2TP did not bring up a ppp interface: " + log_tail(d + "/xl2tpd.log", 4) };
+	}
+	if (!length(iface_v4(dev))) sleep(1500);
+	return { ok: true, iface: dev, vip: iface_v4(dev), xfrm: false };
+}
+
+function l2tp_down(c) {
+	let d = RUNDIR + "/" + replace(c.id ?? "", /[^A-Za-z0-9_-]/g, "_");
+	kill_match("xl2tpd -c " + d + "/xl2tpd.conf");
+	kill_pidfile(d + "/xl2tpd.pid");
+	swan_stop();
+	clear_conn_files();
+}
+
+function l2tp_probe() {
+	let st = state_read();
+	let dev = st.iface ?? "";
+	let s = sas_parse();
+	if (!s.child) return { up: false };
+	if (!length(dev) || !iface_exists(dev)) return { up: false };
+	let b = iface_bytes(dev);
+	return { up: true, iface: dev, vip: iface_v4(dev), rx: b.rx, tx: b.tx, uptime: s.uptime };
+}
+
+// --------------------------------------------------------------------- SSTP
+
+function sstp_prepare(c) {
+	let s = c.config ?? {};
+	if (!length(s.server ?? "")) return { ok: false, error: "server address is required" };
+	if (!length(s.username ?? "")) return { ok: false, error: "username is required" };
+	return { ok: true };
+}
+
+function sstp_up(c) {
+	let s = c.config ?? {};
+	let d = conn_runtime_dir(c.id);
+	let port = intval(s.port, 443);
+	let mtu = cfg_int("tunnel_mtu", 1400);
+	let before = ppp_ifaces();
+	let args = sprintf("sstpc --user %s --password %s --log-level 2 --cert-warn %s:%d ipparam vpnexit nodefaultroute noauth refuse-eap mtu %d mru %d",
+		shellq(s.username ?? ""), shellq(s.password ?? ""), shellq(s.server ?? ""), port, mtu, mtu);
+	if (boolval(s.insecure, true)) run("true");
+	kill_pidfile(d + "/sstpc.pid");
+	spawn_bg(args, d + "/sstpc.log", d + "/sstpc.pid");
+	let dev = wait_ppp(before, 30);
+	if (!length(dev)) {
+		return { ok: false, error: "SSTP did not bring up a ppp interface: " + log_tail(d + "/sstpc.log", 5) };
+	}
+	if (!length(iface_v4(dev))) sleep(1000);
+	return { ok: true, iface: dev, vip: iface_v4(dev), xfrm: false };
+}
+
+function sstp_down(c) {
+	let d = RUNDIR + "/" + replace(c.id ?? "", /[^A-Za-z0-9_-]/g, "_");
+	kill_pidfile(d + "/sstpc.pid");
+	kill_match("sstpc --user");
+}
+
+function sstp_probe() {
+	let st = state_read();
+	let dev = st.iface ?? "";
+	if (!length(dev) || !iface_exists(dev)) return { up: false };
+	let b = iface_bytes(dev);
+	return { up: true, iface: dev, vip: iface_v4(dev), rx: b.rx, tx: b.tx, uptime: 0 };
+}
+
+// ------------------------------------------------------------------ OpenVPN
+
+function ovpn_prepare(c) {
+	let s = c.config ?? {};
+	let raw = replace(s.raw ?? "", /\r/g, "");
+	if (!length(trim(raw))) return { ok: false, error: "paste the .ovpn file contents" };
+	if (!match(raw, /(^|\n)\s*(client|remote)\b/)) return { ok: false, error: "the pasted text does not look like an OpenVPN client profile" };
+	let d = conn_runtime_dir(c.id);
+	let lines = [];
+	for (let line in split(raw, "\n")) {
+		let t = trim(line);
+		if (match(t, /^(daemon|route-nopull|dev|dev-type|writepid|log|log-append)\b/)) continue;
+		push(lines, line);
+	}
+	push(lines, "");
+	push(lines, "# ---- managed by vpnexit ----");
+	push(lines, "client");
+	push(lines, "dev-type tun");
+	push(lines, "dev " + OVPNIFACE);
+	push(lines, "nobind");
+	push(lines, "persist-tun");
+	push(lines, "persist-key");
+	push(lines, "route-nopull");
+	push(lines, "verb 3");
+	push(lines, "ping 10");
+	push(lines, "ping-restart 60");
+	if (length(s.username ?? "") || length(s.password ?? "")) {
+		writefile(d + "/auth.txt", (s.username ?? "") + "\n" + (s.password ?? "") + "\n", "0600");
+		push(lines, "auth-user-pass " + d + "/auth.txt");
+	}
+	writefile(d + "/client.conf", join("\n", lines) + "\n", "0600");
+	return { ok: true, endpoint: ovpn_summary(raw).remote };
+}
+
+function ovpn_up(c) {
+	let d = conn_runtime_dir(c.id);
+	run("ip link del " + OVPNIFACE + " 2>/dev/null");
+	kill_pidfile(d + "/openvpn.pid");
+	kill_match(d + "/client.conf");
+	spawn_bg(sprintf("openvpn --config %s --writepid %s", shellq(d + "/client.conf"), shellq(d + "/openvpn.pid")),
+		d + "/openvpn.log", d + "/openvpn.pid");
+	if (!wait_iface(OVPNIFACE, 30)) {
+		kill_pidfile(d + "/openvpn.pid");
+		return { ok: false, error: "OpenVPN did not come up: " + log_tail(d + "/openvpn.log", 5) };
+	}
+	return { ok: true, iface: OVPNIFACE, vip: iface_v4(OVPNIFACE), xfrm: false };
+}
+
+function ovpn_down(c) {
+	let d = RUNDIR + "/" + replace(c.id ?? "", /[^A-Za-z0-9_-]/g, "_");
+	kill_pidfile(d + "/openvpn.pid");
+	kill_match(d + "/client.conf");
+	sleep(300);
+	run("ip link del " + OVPNIFACE + " 2>/dev/null");
+}
+
+function ovpn_probe() {
+	if (!iface_exists(OVPNIFACE)) return { up: false };
+	let v4 = iface_v4(OVPNIFACE);
+	if (!length(v4)) return { up: false };
+	let b = iface_bytes(OVPNIFACE);
+	return { up: true, iface: OVPNIFACE, vip: v4, rx: b.rx, tx: b.tx, uptime: 0 };
+}
+
+// ------------------------------------------------------ WireGuard/AmneziaWG
+
+// Amnezia exports an "AmneziaWG" profile that is a WireGuard configuration plus
+// obfuscation keys (Jc/Jmin/Jmax/S1/S2/H1..H4).  The kernel module that
+// understands those keys is not part of the official OpenWrt feed, so the panel
+// uses it when present (awg) and otherwise falls back to plain WireGuard with a
+// visible warning instead of failing silently.
+function wg_tool(c) {
+	if (c.type == "amneziawg" && has_bin("/usr/bin/awg")) return "/usr/bin/awg";
+	return "/usr/bin/wg";
+}
+
+function wg_degraded(c) {
+	if (c.type != "amneziawg") return "";
+	if (has_bin("/usr/bin/awg")) return "";
+	return "AmneziaWG module not installed - running as plain WireGuard; obfuscation parameters are ignored";
+}
+
+function wg_parse_cfg(c) {
+	let p = wg_parse((c.config ?? {}).raw ?? "");
+	if (length(p.error)) return p;
+	return p;
+}
+
+function wg_prepare(c) {
+	let p = wg_parse_cfg(c);
+	if (length(p.error)) return { ok: false, error: p.error };
+	let d = conn_runtime_dir(c.id);
+	let lines = ["[Interface]", "PrivateKey = " + p.iface.privatekey];
+	if (length(p.iface.listenport ?? "")) push(lines, "ListenPort = " + p.iface.listenport);
+	if (length(p.iface.fwmark ?? "")) push(lines, "FwMark = " + p.iface.fwmark);
+	// The obfuscation keys only exist in the AmneziaWG tool.  Passing them to
+	// plain wg would abort the whole configuration, so they are written only
+	// when awg is the tool that will consume the file.
+	if (c.type == "amneziawg" && wg_tool(c) == "/usr/bin/awg") {
+		for (let k in ["jc", "jmin", "jmax", "s1", "s2", "h1", "h2", "h3", "h4"]) {
+			if (length(p.iface[k] ?? "")) push(lines, uc(k) + " = " + p.iface[k]);
+		}
+	}
+	for (let peer in p.peers) {
+		push(lines, "");
+		push(lines, "[Peer]");
+		push(lines, "PublicKey = " + (peer.publickey ?? ""));
+		if (length(peer.presharedkey ?? "")) push(lines, "PresharedKey = " + peer.presharedkey);
+		if (length(peer.allowedips ?? "")) push(lines, "AllowedIPs = " + peer.allowedips);
+		if (length(peer.endpoint ?? "")) push(lines, "Endpoint = " + peer.endpoint);
+		if (length(peer.persistentkeepalive ?? "")) push(lines, "PersistentKeepalive = " + peer.persistentkeepalive);
+	}
+	push(lines, "");
+	writefile(d + "/wg.conf", join("\n", lines), "0600");
+	let addrs = split_addresses(p.iface.address ?? "");
+	let mtu = intval(p.iface.mtu, 0);
+	writefile(d + "/meta.json", sprintf("%J", {
+		addrs: addrs, mtu: mtu, tool: wg_tool(c), degraded: wg_degraded(c),
+		endpoint: p.peers[0] ? (p.peers[0].endpoint ?? "") : ""
+	}), "0600");
+	return { ok: true, endpoint: p.peers[0] ? (p.peers[0].endpoint ?? "") : "", degraded: wg_degraded(c) };
+}
+
+function wg_up(c) {
+	let d = conn_runtime_dir(c.id);
+	let meta;
+	try { meta = json(readfile(d + "/meta.json")); } catch (e) { return { ok: false, error: "run save first" }; }
+	let tool = meta.tool ?? "/usr/bin/wg";
+	if (!has_bin(tool)) return { ok: false, error: "neither wg nor awg is installed" };
+	run("ip link del " + WGIFACE + " 2>/dev/null");
+	let add = run("ip link add " + WGIFACE + " type wireguard");
+	if (add.rc != 0) return { ok: false, error: "cannot create a WireGuard interface: " + clean(add.out) };
+	let set = run(sprintf("%s setconf %s %s", tool, WGIFACE, shellq(d + "/wg.conf")));
+	if (set.rc != 0) {
+		run("ip link del " + WGIFACE + " 2>/dev/null");
+		return { ok: false, error: "the peer configuration was rejected: " + clean(set.out) };
+	}
+	for (let a in meta.addrs ?? []) run(sprintf("ip addr add %s dev %s", shellq(a), WGIFACE));
+	let mtu = intval(meta.mtu, 0);
+	if (mtu <= 0) mtu = cfg_int("tunnel_mtu", 1400);
+	run(sprintf("ip link set mtu %d up dev %s", mtu, WGIFACE));
+	if (!wait_iface(WGIFACE, 8)) {
+		return { ok: false, error: "the interface has no address - add one to the [Interface] Address line" };
+	}
+	return { ok: true, iface: WGIFACE, vip: iface_v4(WGIFACE), xfrm: false, degraded: meta.degraded ?? "" };
+}
+
+function wg_down(c) {
+	let d = RUNDIR + "/" + replace(c.id ?? "", /[^A-Za-z0-9_-]/g, "_");
+	if (fs.stat(d + "/wg.conf")) run("ip link del " + WGIFACE + " 2>/dev/null");
+	run("ip link del " + WGIFACE + " 2>/dev/null");
+}
+
+function wg_probe() {
+	if (!iface_exists(WGIFACE)) return { up: false };
+	let v4 = iface_v4(WGIFACE);
+	if (!length(v4)) return { up: false };
+	let b = iface_bytes(WGIFACE);
+	return { up: true, iface: WGIFACE, vip: v4, rx: b.rx, tx: b.tx, uptime: 0 };
+}
+
+// ---------------------------------------------------------- VLESS / REALITY
+
+function sb_config(c) {
+	let s = c.config ?? {};
+	let v = vless_parse(s.raw ?? "");
+	if (length(v.error ?? "")) return { error: v.error };
+	let ob = {
+		type: "vless",
+		tag: "proxy",
+		server: v.host,
+		server_port: v.port,
+		uuid: v.uuid
+	};
+	if (length(v.flow)) ob.flow = v.flow;
+	if (v.net == "ws" || v.net == "grpc" || v.net == "httpupgrade") {
+		let tr = { type: v.net };
+		if (v.net == "ws") { tr.path = length(v.path) ? v.path : "/"; if (length(v.host_header)) tr.headers = { Host: v.host_header }; }
+		if (v.net == "grpc") tr.service_name = v.service;
+		if (v.net == "httpupgrade") tr.path = length(v.path) ? v.path : "/";
+		ob.transport = tr;
+	}
+	let tls = { enabled: true, server_name: v.sni };
+	if (v.security == "reality") {
+		tls.utls = { enabled: true, fingerprint: length(v.fp) ? v.fp : "chrome" };
+		tls.reality = { enabled: true, public_key: v.pbk, short_id: v.sid };
+	} else if (v.security == "tls") {
+		tls.utls = { enabled: true, fingerprint: length(v.fp) ? v.fp : "chrome" };
+		if (boolval(v.allow_insecure, false)) tls.insecure = true;
+	} else {
+		tls.enabled = false;
+	}
+	if (tls.enabled) ob.tls = tls;
+	return {
+		ok: true,
+		cfg: {
+			log: { level: "warn", timestamp: true },
+			inbounds: [{
+				type: "tun", tag: "tun-in", interface_name: VLESSIFACE,
+				address: ["172.19.66.1/30"], mtu: cfg_int("tunnel_mtu", 1400) + 20,
+				auto_route: false, strict_route: false, stack: "system"
+			}],
+			outbounds: [ob, { type: "direct", tag: "direct" }],
+			// auto_detect_interface makes sing-box bind every outbound socket to
+			// the detected default device, which fails with EPERM on this
+			// firmware.  vpnexit does the interface selection itself.
+			route: { rules: [{ action: "sniff" }], final: "proxy", auto_detect_interface: false }
+		}
+	};
+}
+
+function vless_prepare(c) {
+	let r = sb_config(c);
+	if (length(r.error ?? "")) return { ok: false, error: r.error };
+	let d = conn_runtime_dir(c.id);
+	writefile(d + "/singbox.json", sprintf("%J", r.cfg), "0600");
+	let chk = run(sprintf("sing-box check -c %s", shellq(d + "/singbox.json")));
+	if (chk.rc != 0) return { ok: false, error: "sing-box rejected the configuration: " + clean(chk.out) };
+	return { ok: true, endpoint: c.config.host + ":" + c.config.port };
+}
+
+function vless_up(c) {
+	let d = conn_runtime_dir(c.id);
+	kill_pidfile(d + "/singbox.pid");
+	run("ip link del " + VLESSIFACE + " 2>/dev/null");
+	spawn_bg(sprintf("sing-box run -c %s", shellq(d + "/singbox.json")), d + "/singbox.log", d + "/singbox.pid");
+	if (!wait_iface(VLESSIFACE, 20)) {
+		kill_pidfile(d + "/singbox.pid");
+		return { ok: false, error: "sing-box did not create the tunnel: " + log_tail(d + "/singbox.log", 5) };
+	}
+	return { ok: true, iface: VLESSIFACE, vip: iface_v4(VLESSIFACE), xfrm: false };
+}
+
+function vless_down(c) {
+	let d = RUNDIR + "/" + replace(c.id ?? "", /[^A-Za-z0-9_-]/g, "_");
+	kill_pidfile(d + "/singbox.pid");
+	kill_match(d + "/singbox.json");
+	sleep(300);
+	run("ip link del " + VLESSIFACE + " 2>/dev/null");
+}
+
+function vless_probe() {
+	if (!iface_exists(VLESSIFACE)) return { up: false };
+	let v4 = iface_v4(VLESSIFACE);
+	if (!length(v4)) return { up: false };
+	let b = iface_bytes(VLESSIFACE);
+	return { up: true, iface: VLESSIFACE, vip: v4, rx: b.rx, tx: b.tx, uptime: 0 };
+}
+
+// --------------------------------------------------------------- dispatchers
+
+function drv_prepare(c) {
+	let t = c.type;
+	if (t == "ikev2") return ike_prepare(c);
+	if (t == "l2tp") return l2tp_prepare(c);
+	if (t == "sstp") return sstp_prepare(c);
+	if (t == "openvpn") return ovpn_prepare(c);
+	if (t == "wireguard" || t == "amneziawg") return wg_prepare(c);
+	if (t == "vless") return vless_prepare(c);
+	return { ok: false, error: "unknown protocol " + t };
+}
+
+function drv_up(c) {
+	let t = c.type;
+	if (t == "ikev2") return ike_up(c);
+	if (t == "l2tp") return l2tp_up(c);
+	if (t == "sstp") return sstp_up(c);
+	if (t == "openvpn") return ovpn_up(c);
+	if (t == "wireguard" || t == "amneziawg") return wg_up(c);
+	if (t == "vless") return vless_up(c);
+	return { ok: false, error: "unknown protocol " + t };
+}
+
+function drv_down(c) {
+	if (c == null) return;
+	let t = c.type;
+	if (t == "ikev2") return ike_down(c);
+	if (t == "l2tp") return l2tp_down(c);
+	if (t == "sstp") return sstp_down(c);
+	if (t == "openvpn") return ovpn_down(c);
+	if (t == "wireguard" || t == "amneziawg") return wg_down(c);
+	if (t == "vless") return vless_down(c);
+}
+
+function drv_probe(c) {
+	if (c == null) return { up: false };
+	let t = c.type;
+	if (t == "ikev2") return ike_probe();
+	if (t == "l2tp") return l2tp_probe();
+	if (t == "sstp") return sstp_probe();
+	if (t == "openvpn") return ovpn_probe();
+	if (t == "wireguard" || t == "amneziawg") return wg_probe();
+	if (t == "vless") return vless_probe();
+	return { up: false };
+}
+
+// ------------------------------------------------------------------ routing
+// The mark + policy route is protocol independent.  What changes is the shape
+// of the route (an XFRM tunnel keeps the uplink route and is matched by policy,
+// a tun/wg/ppp interface becomes the table default) and the NAT rule.
 
 function table_exists(spec) {
 	return run("nft list table " + spec).rc == 0;
 }
 
-function routing_ruleset(vip, lan, wan, gw, server_ip, block_v6) {
+// filter and nat for forwarded LAN traffic
+function routing_ruleset(o) {
 	let mark = cfg("mark", "0x1a1");
 	let mtu = cfg_int("tunnel_mtu", 1400);
-	// IKEv2/UDP + ESP adds about 80 bytes on this path. 1400 therefore leaves
-	// 1320 for TCP, while 1360 previously caused black-holed fragments on the
-	// Starlink/ISP path. Clamp conservatively; users can raise tunnel_mtu later.
-	let mss = mtu - 80;
+	let mss = o.xfrm ? (mtu - 80) : (mtu - 40);
 	if (mss < 1200) mss = 1200;
-	let lan_cidr = mask4(iface_cidr(lan)) ?? "192.168.1.0/24";
-	let wan_cidr = mask4(iface_cidr(wan)) ?? "";
-	// DNS is intentionally sent through the tunnel. This prevents the ISP/WAN
-	// resolver from leaking the query and avoids filtered domains returning an
-	// incomplete or blocked answer.
-	let excl = ["127.0.0.0/8", "224.0.0.0/4", "255.255.255.255/32", lan_cidr, vip + "/32"];
+	let lan_cidr = mask4(iface_cidr(o.lan)) ?? "192.168.1.0/24";
+	let wan_cidr = mask4(iface_cidr(o.wan)) ?? "";
+	let excl = ["127.0.0.0/8", "224.0.0.0/4", "255.255.255.255/32", lan_cidr];
+	if (length(o.vip)) push(excl, o.vip + "/32");
 	if (length(wan_cidr)) push(excl, wan_cidr);
-	if (length(server_ip)) push(excl, server_ip + "/32");
+	if (length(o.server_ip)) push(excl, o.server_ip + "/32");
 
 	let t = [];
 	push(t, "table inet vpnexit {");
@@ -644,18 +1571,21 @@ function routing_ruleset(vip, lan, wan, gw, server_ip, block_v6) {
 	push(t, "\t}");
 	push(t, "\tchain vpx_mark {");
 	push(t, "\t\ttype filter hook prerouting priority mangle; policy accept;");
-	push(t, sprintf("\t\tiifname != \"%s\" return", lan));
+	push(t, sprintf("\t\tiifname != \"%s\" return", o.lan));
 	push(t, "\t\tip daddr @exclude4 return");
 	push(t, sprintf("\t\tmeta mark set %s counter", mark));
 	push(t, "\t}");
 	push(t, "\tchain vpx_mss {");
 	push(t, "\t\ttype filter hook postrouting priority mangle; policy accept;");
-	push(t, sprintf("\t\tmeta mark %s tcp flags syn tcp option maxseg size set %d", mark, mss));
+	if (o.xfrm) {
+		push(t, sprintf("\t\tmeta mark %s tcp flags syn tcp option maxseg size set %d", mark, mss));
+	} else {
+		push(t, sprintf("\t\toifname \"%s\" meta mark %s tcp flags syn tcp option maxseg size set %d", o.iface, mark, mss));
+	}
 	push(t, "\t}");
-	// DNS is tunneled to avoid ISP filtering, but only for public resolvers.
-	// The router's own upstream usually lives on the LAN (the ISP router), and
-	// marking those queries sent them into the tunnel where nothing answers,
-	// which broke DNS for LuCI diagnostics and for the router itself.
+	// DNS is tunneled to avoid ISP filtering, but only for public resolvers:
+	// the router's own upstream usually lives on the LAN (the ISP router) and
+	// marking those queries sent them into the tunnel where nothing answers.
 	push(t, "\tchain vpx_dnsout {");
 	push(t, "\t\ttype route hook output priority mangle; policy accept;");
 	push(t, "\t\tudp dport 53 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 127.0.0.0/8 } return");
@@ -663,38 +1593,80 @@ function routing_ruleset(vip, lan, wan, gw, server_ip, block_v6) {
 	push(t, sprintf("\t\tudp dport 53 meta mark set %s counter", mark));
 	push(t, sprintf("\t\ttcp dport 53 meta mark set %s counter", mark));
 	push(t, "\t}");
-	// Force clients that manually configured 1.1.1.1/8.8.8.8/etc. to use
-	// dnsmasq on the router, so a stale/filtered WAN resolver cannot return
-	// NXDOMAIN while the router itself has a valid answer.
 	push(t, "\tchain vpx_dnsredirect {");
 	push(t, "\t\ttype nat hook prerouting priority dstnat; policy accept;");
-	push(t, sprintf("\t\tiifname \"%s\" udp dport 53 redirect to :53", lan));
-	push(t, sprintf("\t\tiifname \"%s\" tcp dport 53 redirect to :53", lan));
+	push(t, sprintf("\t\tiifname \"%s\" udp dport 53 redirect to :53", o.lan));
+	push(t, sprintf("\t\tiifname \"%s\" tcp dport 53 redirect to :53", o.lan));
 	push(t, "\t}");
-	if (block_v6) {
+	if (o.block_v6) {
 		push(t, "\tchain vpx_v6 {");
 		push(t, "\t\ttype filter hook forward priority filter; policy accept;");
-		push(t, sprintf("\t\tiifname \"%s\" oifname \"%s\" meta nfproto ipv6 drop", lan, wan));
+		push(t, sprintf("\t\tiifname \"%s\" oifname \"%s\" meta nfproto ipv6 drop", o.lan, o.wan));
 		push(t, "\t}");
 	}
 	push(t, "}");
 	push(t, "table ip vpnexit_nat {");
 	push(t, "\tchain vpx_nat {");
 	push(t, "\t\ttype nat hook postrouting priority srcnat; policy accept;");
-	push(t, sprintf("\t\toifname \"%s\" meta mark %s counter snat ip to %s", wan, mark, vip));
+	if (o.xfrm) {
+		push(t, sprintf("\t\toifname \"%s\" meta mark %s counter snat ip to %s", o.wan, mark, o.vip));
+	} else {
+		push(t, sprintf("\t\toifname \"%s\" meta mark %s counter masquerade", o.iface, mark));
+	}
 	push(t, "\t}");
 	push(t, "}");
 	return join("\n", t) + "\n";
 }
 
-function routing_apply(vip) {
-	if (!length(vip)) return { ok: false, error: "tunnel has no address yet" };
+// fw4 drops anything that is forwarded to an interface it does not know, so a
+// tunnel interface gets a throw-away zone while it is in use.
+function zone_active() { return cursor().get("firewall", "vpnexit", "name") != null; }
+
+function zone_ensure(dev) {
+	if (!length(dev)) return false;
+	let cur = cursor().get("firewall", "vpnexit", "device");
+	if (cur == dev) return true;
+	let c = cursor();
+	c.set("firewall", "vpnexit", "zone");
+	c.set("firewall", "vpnexit", "name", "vpnexit");
+	c.set("firewall", "vpnexit", "input", "REJECT");
+	c.set("firewall", "vpnexit", "output", "ACCEPT");
+	c.set("firewall", "vpnexit", "forward", "ACCEPT");
+	c.set("firewall", "vpnexit", "masq", "0");
+	c.set("firewall", "vpnexit", "mtu_fix", "0");
+	c.set("firewall", "vpnexit", "device", dev);
+	c.set("firewall", "vpnexit_fwd", "forwarding");
+	c.set("firewall", "vpnexit_fwd", "src", "lan");
+	c.set("firewall", "vpnexit_fwd", "dest", "vpnexit");
+	c.commit("firewall");
+	run("/etc/init.d/firewall reload >/dev/null 2>&1");
+	log("routing: firewall zone opened for " + dev);
+	return true;
+}
+
+function zone_remove() {
+	if (!zone_active()) return;
+	cursor().delete("firewall", "vpnexit");
+	cursor().delete("firewall", "vpnexit_fwd");
+	cursor().commit("firewall");
+	run("/etc/init.d/firewall reload >/dev/null 2>&1");
+	log("routing: firewall zone removed");
+}
+
+function routing_apply(iface, vip) {
+	let xfrm = !length(iface);
+	if (!xfrm && !iface_exists(iface)) return { ok: false, error: "interface " + iface + " is not up" };
+	if (xfrm && !length(vip)) return { ok: false, error: "tunnel has no address yet" };
 	let lan = lan_iface();
 	let dr = default_route();
 	if (!dr.dev) return { ok: false, error: "cannot determine the WAN interface" };
-	let server = state_read().server_ip ?? "";
-	let block_v6 = cfg_bool("block_ipv6", true);
-	let rules = routing_ruleset(vip, lan, dr.dev, dr.gw, server, block_v6);
+	let st = state_read();
+	let server = st.server_ip ?? "";
+	if (!length(server) && length(st.server ?? "")) server = resolve4(st.server);
+	let rules = routing_ruleset({
+		lan: lan, wan: dr.dev, gw: dr.gw, iface: iface, vip: vip,
+		xfrm: xfrm, server_ip: server, block_v6: cfg_bool("block_ipv6", true)
+	});
 	ensure_dir(RUN);
 	let path = RUN + "/last.nft";
 	fs.writefile(path, rules);
@@ -714,12 +1686,19 @@ function routing_apply(vip) {
 		return { ok: false, error: "cannot apply rules: " + clean(ap.out) };
 	}
 
+	if (!xfrm) zone_ensure(iface);
+
 	let table = cfg_int("table", 417);
 	let prio = cfg_int("rule_priority", 1000);
 	let mark = cfg("mark", "0x1a1");
-	let route = length(dr.gw)
-		? sprintf("ip route replace default via %s dev %s table %d", dr.gw, dr.dev, table)
-		: sprintf("ip route replace default dev %s table %d", dr.dev, table);
+	let route;
+	if (xfrm) {
+		route = length(dr.gw)
+			? sprintf("ip route replace default via %s dev %s table %d", dr.gw, dr.dev, table)
+			: sprintf("ip route replace default dev %s table %d", dr.dev, table);
+	} else {
+		route = sprintf("ip route replace default dev %s table %d", iface, table);
+	}
 	let rr = run(route);
 	if (rr.rc != 0) {
 		log("routing: cannot add table route: " + clean(rr.out));
@@ -729,8 +1708,8 @@ function routing_apply(vip) {
 		run(sprintf("ip rule del fwmark %s lookup %d priority %d", mark, table, prio));
 	let ar = run(sprintf("ip rule add fwmark %s lookup %d priority %d", mark, table, prio));
 	if (ar.rc != 0) return { ok: false, error: "cannot add ip rule: " + clean(ar.out) };
-	log(sprintf("routing: active (%s -> %s via %s, vip %s)", lan, dr.dev, dr.gw ?? "-", vip));
-	return { ok: true, vip: vip };
+	log(sprintf("routing: active (%s -> %s, iface %s, vip %s)", lan, dr.dev, length(iface) ? iface : "xfrm", vip));
+	return { ok: true, vip: vip, iface: iface };
 }
 
 function routing_clear() {
@@ -743,21 +1722,20 @@ function routing_clear() {
 	for (let i = 0; i < 4; i++)
 		run(sprintf("ip rule del fwmark %s lookup %d priority %d", mark, table, prio));
 	run(sprintf("ip route flush table %d", table));
+	zone_remove();
 }
 
-function routing_active(vip) {
-	if (!length(vip)) return false;
+function routing_active(iface, vip) {
+	if (!length(iface) && !length(vip)) return false;
 	if (!table_exists("inet vpnexit")) return false;
 	if (run(sprintf("ip rule show | grep -q 'fwmark %s lookup %d'", cfg("mark", "0x1a1"), cfg_int("table", 417))).rc != 0) return false;
 	if (run(sprintf("ip route show table %d | grep -q default", cfg_int("table", 417))).rc != 0) return false;
 	return true;
 }
 
-// ------------------------------------------------------------ connect flow
-
 // ------------------------------------------------------------------ selftest
-// Declared before do_connect() on purpose: ucode resolves function symbols at
-// compile time, so a call that appears earlier in the file would see null.
+// Declared before the connect flow on purpose: ucode resolves function symbols
+// at compile time, so a call that appears earlier in the file would see null.
 
 function probe_ip(marked) {
 	if (marked) {
@@ -774,16 +1752,18 @@ function probe_ip(marked) {
 
 function selftest_internal() {
 	let st = state_read();
-	if (!length(st.vip ?? "")) return { ok: false, detail: "tunnel is down" };
-	let temporary = false;
-	if (!routing_active(st.vip)) {
-		let rr = routing_apply(st.vip);
+	if (st.state != "connected" && st.state != "connecting") return { ok: false, detail: "tunnel is down" };
+	let c = resolve_target(st.conn_id ?? "");
+	if (c == null) return { ok: false, detail: "the connected profile is gone" };
+	let down_rules = false;
+	if (cfg_bool("share_lan", true) && !routing_active(st.iface ?? "", st.vip ?? "")) {
+		let rr = routing_apply(st.iface ?? "", st.vip ?? "");
 		if (!rr.ok) return { ok: false, detail: rr.error };
-		temporary = true;
+		down_rules = true;
 	}
 	let direct = probe_ip(false);
 	let marked = probe_ip(true);
-	if (temporary) routing_clear();
+	if (down_rules) routing_clear();
 	if (!length(marked)) return { ok: false, detail: "no answer through the tunnel", direct: direct };
 	if (length(direct) && direct == marked) return { ok: false, detail: "traffic still leaves through the router uplink", direct: direct };
 	return { ok: true, ip: marked, direct: direct, detail: "exit verified" };
@@ -804,128 +1784,85 @@ function fix_resolv() {
 	log("resolver: restored /etc/resolv.conf -> " + target);
 }
 
-function wait_child(seconds) {
-	for (let i = 0; i < seconds; i++) {
-		let s = sas_parse();
-		if (s.child && length(s.vip)) return s;
-		sleep(1000);
-	}
-	return sas_parse();
-}
+// ------------------------------------------------------------ connect flow
 
-function teardown(keep_state) {
+function connect_impl(c, verify) {
+	let prev = state_read();
+	if (length(prev.conn_id ?? "") && prev.conn_id != c.id) {
+		let pc = resolve_target(prev.conn_id);
+		if (pc != null) {
+			log("connect: tearing down the previous tunnel (" + (pc.name ?? pc.type) + ")");
+			drv_down(pc);
+		}
+	}
 	routing_clear();
-	run("swanctl --terminate --ike " + CONN);
-	// Give charon time to delete the SAD/policies before anything reconnects.
-	for (let i = 0; i < 6; i++) {
-		let q = sas_parse();
-		if (!q.ike && !q.child) break;
-		sleep(500);
+	state_patch({
+		state: "connecting", conn_id: c.id, type: c.type, name: c.name ?? "",
+		flag: c.flag ?? "", source: c.source ?? "manual", iface: "", vip: "",
+		exit_ip: "", error: "", degraded: "", server_ip: "", checked_at: now()
+	});
+	log(sprintf("connect: %s (%s)", c.name ?? c.id, c.type));
+
+	let prep = drv_prepare(c);
+	if (!prep.ok) {
+		log("connect: prepare failed: " + prep.error);
+		state_patch({ state: "error", error: prep.error, checked_at: now() });
+		return { ok: false, error: prep.error };
 	}
-}
-
-function connect_impl(key, index, verify) {
-	let loc = find_location(key);
-	if (!loc) return { ok: false, error: "unknown location " + key };
-	let idx = intval(index, 0);
-	if (idx < 0 || idx >= length(loc.servers)) idx = 0;
-	let srv = loc.servers[idx];
-	if (!length(srv.user) || !length(srv.pass)) return { ok: false, error: "profile has no credentials" };
-
-	log(sprintf("connect: %s (%s)", key, srv.host));
-	state_patch({ state: "connecting", key: key, index: idx, error: "", exit_ip: "", server_host: srv.host, checked_at: now() });
-
-	learn_chain(srv.host);
-	write_conn(srv);
-	run("swanctl --load-creds");
-	let lc = run("swanctl --load-conns");
-	if (lc.rc != 0) {
-		let msg = clean(lc.out);
-		log("connect: cannot load connection: " + msg);
-		state_patch({ state: "error", error: "cannot load connection" });
-		return { ok: false, error: msg };
+	let up = drv_up(c);
+	if (!up.ok) {
+		log("connect: up failed: " + up.error);
+		state_patch({ state: "error", error: up.error, checked_at: now() });
+		return { ok: false, error: up.error };
 	}
+	state_patch({
+		state: "connected", iface: up.iface ?? "", vip: up.vip ?? "",
+		xfrm: up.xfrm ? 1 : 0, degraded: up.degraded ?? "",
+		server: up.server ?? conn_endpoint(c), server_ip: up.remote ?? "",
+		since: now(), misses: 0, attempts: 0, checked_at: now()
+	});
+	if (length(up.degraded ?? "")) log("connect: warning " + up.degraded);
 
-	routing_clear();
-
-	// Peer selection: a server that never answers IKE_SA_INIT (down, rate
-	// limited, or filtered by the ISP) used to block the whole connect for
-	// 30 seconds. Try the remaining servers of the same location instead.
-	let cands = [];
-	for (let k = 0; k < length(loc.servers); k++) push(cands, (idx + k) % length(loc.servers));
-	let s = null, used = idx, lastErr = "";
-	for (let ci = 0; ci < length(cands) && ci < 3; ci++) {
-		let si = cands[ci];
-		let cand = loc.servers[si];
-		if (!length(cand.user) || !length(cand.pass)) continue;
-		if (ci > 0) log(sprintf("connect: %s did not answer, trying %s", srv.host, cand.host));
-		srv = cand;
-		learn_chain(cand.host);
-		write_conn(cand);
-		run("swanctl --load-creds");
-		let lc2 = run("swanctl --load-conns");
-		if (lc2.rc != 0) { lastErr = clean(lc2.out); continue; }
-		teardown();
-		let rr2 = run("swanctl --initiate --child " + CHILD + " --timeout 15");
-		let w = wait_child(8);
-		if (w.child && length(w.vip)) { s = w; used = si; break; }
-		lastErr = clean(rr2.out);
-		run("swanctl --terminate --ike " + CONN);
-	}
-	if (s == null) {
-		let m = match(lastErr, /\n[^\n]*(failed|error|no trusted|unable)[^\n]*/);
-		log("connect: handshake failed: " + lastErr);
-		state_patch({
-			state: "error", vip: "", exit_ip: "", checked_at: now(),
-			server_host: srv.host, index: used,
-			error: (m ? trim(m[0]) : "handshake failed")
-		});
-		return { ok: false, error: "handshake failed: " + (m ? trim(m[0]) : "no CHILD_SA") };
-	}
-
-	state_patch({ vip: s.vip, server_ip: s.remote, server_host: srv.host, index: used, since: now(), checked_at: now(), misses: 0 });
 	let routing = { active: false };
 	if (cfg_bool("share_lan", true)) {
-		let rr = routing_apply(s.vip);
+		let rr = routing_apply(up.iface ?? "", up.vip ?? "");
 		routing.active = rr.ok;
 		if (!rr.ok) log("connect: routing failed: " + rr.error);
 	}
+	fix_resolv();
 
 	let test = { ok: false, detail: "not tested" };
-	if (verify) test = selftest_internal();
-
-	let err = "";
-	if (verify && !test.ok) err = test.detail ?? "self-test failed";
-	state_patch({
-		state: "connected", exit_ip: test.ip ?? "", error: err,
-		attempts: 0, checked_at: now(), vip: s.vip
-	});
-	fix_resolv();
-	log(sprintf("connect: up, vip %s, exit %s", s.vip, test.ip ?? "-"));
-	return { ok: true, vip: s.vip, exit_ip: test.ip ?? "", warning: err };
+	if (verify && cfg_bool("share_lan", true)) test = selftest_internal();
+	let warn = "";
+	if (verify && cfg_bool("share_lan", true) && !test.ok) warn = test.detail ?? "self-test failed";
+	state_patch({ exit_ip: test.ip ?? "", error: "", warning: warn, checked_at: now() });
+	log(sprintf("connect: up, iface %s, vip %s, exit %s", up.iface ?? "xfrm", up.vip ?? "-", test.ip ?? "-"));
+	return { ok: true, iface: up.iface ?? "", vip: up.vip ?? "", exit_ip: test.ip ?? "", warning: warn, routing: routing.active };
 }
 
 function disconnect_impl() {
 	log("disconnect");
-	teardown();
+	let st = state_read();
+	let c = length(st.conn_id ?? "") ? resolve_target(st.conn_id) : null;
+	routing_clear();
+	if (c != null) drv_down(c);
+	else ike_down();
 	fix_resolv();
-	clear_conn_files();
-	state_patch({ state: "idle", vip: "", exit_ip: "", error: "", checked_at: now() });
+	state_patch({ state: "idle", conn_id: "", iface: "", vip: "", exit_ip: "", error: "", warning: "", degraded: "", server_ip: "", rx: 0, tx: 0, uptime: 0, checked_at: now() });
 	return { ok: true };
 }
 
 // --------------------------------------------------------------------- lock
 // One connect/disconnect at a time: the panel can be open in two tabs and the
 // supervisor may fire at the same moment, which would otherwise race on the
-// nftables table and the swanctl connection.
+// nftables table and the tunnel.
 
 function lock_acquire() {
 	let dir = RUN + "/lock";
 	for (let i = 0; i < 20; i++) {
 		if (run("mkdir " + shellq(dir) + " 2>/dev/null").rc == 0) return true;
 		// Never wait for a lock whose owner is gone: the web server kills long
-		// running requests, which used to leave the directory behind and every
-		// later connect answered "busy" until the stale timeout expired.
+		// running requests, which used to leave the directory behind.
 		if (!worker_alive()) { run("rm -rf " + shellq(dir)); continue; }
 		sleep(300);
 	}
@@ -944,17 +1881,17 @@ function worker_alive() {
 }
 
 // Connecting can take longer than uhttpd's script timeout, so the API hands the
-// work to a detached worker and answers immediately; the panel already polls
-// /status, which is where the result shows up.
-function start_worker(key, idx) {
+// work to a detached worker and answers immediately; the panel polls /status.
+function start_worker(id) {
 	run("rm -rf " + shellq(RUN + "/lock"));
 	run("mkdir -p " + shellq(RUN + "/lock"));
+	let c = resolve_target(id);
 	state_patch({
-		state: "connecting", key: key, index: idx, error: "",
-		vip: "", rx: 0, tx: 0, uptime: 0, checked_at: now()
+		state: "connecting", conn_id: id, type: c ? c.type : "", name: c ? (c.name ?? "") : "",
+		flag: c ? (c.flag ?? "") : "", iface: "", vip: "", error: "", rx: 0, tx: 0, uptime: 0, checked_at: now()
 	});
-	let cmd = sprintf("setsid %s %s job-connect %s %d >/dev/null 2>&1 & echo $!",
-		"/usr/bin/ucode", "/usr/share/vpnexit/vpnexit.uc", shellq(key), idx);
+	let cmd = sprintf("setsid %s %s job-connect %s >/dev/null 2>&1 & echo $!",
+		"/usr/bin/ucode", "/usr/share/vpnexit/vpnexit.uc", shellq(id));
 	let r = run(cmd);
 	let pid = intval(trim(r.out), 0);
 	if (pid <= 0) return false;
@@ -962,11 +1899,14 @@ function start_worker(key, idx) {
 	return true;
 }
 
-function do_connect(key, index, verify) {
+function do_connect(id, verify) {
 	if (!lock_acquire()) return { ok: false, error: "busy: another operation is running" };
 	let r;
-	try { r = connect_impl(key, index, verify); }
-	catch (e) { r = { ok: false, error: "" + e }; }
+	try {
+		let c = resolve_target(id);
+		if (c == null) r = { ok: false, error: "unknown connection " + id };
+		else r = connect_impl(c, verify);
+	} catch (e) { r = { ok: false, error: "" + e }; }
 	lock_release();
 	return r;
 }
@@ -986,27 +1926,52 @@ function status_obj() {
 	let st = state_read();
 	let out = {
 		state: st.state ?? "idle",
+		conn_id: st.conn_id ?? "",
+		type: st.type ?? "",
+		type_label: length(st.type ?? "") ? type_label(st.type) : "",
+		name: st.name ?? "",
+		iface: st.iface ?? "",
 		vip: st.vip ?? "",
 		exit_ip: st.exit_ip ?? "",
 		error: st.error ?? "",
-		warning: "",
+		warning: st.warning ?? "",
+		degraded: st.degraded ?? "",
+		server: st.server ?? "",
 		uptime: intval(st.uptime, 0),
 		rx: intval(st.rx, 0),
 		tx: intval(st.tx, 0),
-		routing: { active: routing_active(st.vip ?? ""), share_lan: cfg_bool("share_lan", true) },
+		routing: { active: routing_active(st.iface ?? "", st.vip ?? ""), share_lan: cfg_bool("share_lan", true) },
 		since: intval(st.since, 0)
 	};
-	let loc = st.key ? find_location(st.key) : null;
-	if (loc != null) {
-		out.location = { key: loc.key, title: loc.title, country: loc.country, flag: loc.flag, premium: loc.premium };
+	if (st.source == "feed" && length(st.conn_id ?? "")) {
+		let p = split(st.conn_id, ":");
+		let loc = find_location(p[1] ?? "");
+		if (loc != null) {
+			out.location = { key: loc.key, title: loc.title, country: loc.country, flag: loc.flag, premium: loc.premium };
+			out.server_index = intval(p[2], 0);
+		}
 	}
-	if (length(st.server_host ?? "")) out.server = { host: st.server_host, index: intval(st.index, 0) };
-	if (out.state == "connected" && !out.routing.active && out.routing.share_lan) {
-		out.warning = "routing rules are missing";
-	}
-	if (out.state == "connected" && !out.routing.share_lan) {
-		out.warning = "LAN sharing is disabled in settings";
-	}
+	if (out.state == "connected" && !out.routing.active && out.routing.share_lan) out.warning = "routing rules are missing";
+	if (out.state == "connected" && !out.routing.share_lan) out.warning = "LAN sharing is disabled in settings";
+	return out;
+}
+
+function conn_view(c) {
+	let st = state_read();
+	let active = st.conn_id == c.id;
+	let p = active ? drv_probe(c) : { up: false };
+	return {
+		id: c.id, type: c.type, type_label: type_label(c.type), name: c.name ?? "",
+		endpoint: conn_endpoint(c), share_lan: c.share_lan !== false,
+		degraded: c.type == "amneziawg" ? wg_degraded(c) : "",
+		active: active, up: !!p.up, vip: p.vip ?? "", rx: p.rx ?? 0, tx: p.tx ?? 0,
+		created: c.created ?? 0
+	};
+}
+
+function connections_list() {
+	let out = [];
+	for (let c in conns_load().items) push(out, conn_view(c));
 	return out;
 }
 
@@ -1015,41 +1980,43 @@ function status_obj() {
 function supervise_once() {
 	let st = state_read();
 
-	// A connect/disconnect worker owns the tunnel while it runs. Interfering
-	// here used to kill the SA the worker was just building, which produced
-	// duplicate connects and the "handshake failed" loop.
+	// A connect/disconnect worker owns the tunnel while it runs.
 	if (worker_alive()) return;
 
-	// After a failure, keep trying periodically instead of staying dead: many
-	// peers come back after an outage, and the user should not have to click.
 	if (st.state == "error") {
 		if (!cfg_bool("auto_reconnect", true)) return;
+		if (!length(st.conn_id ?? "")) return;
 		let wait = cfg_int("retry_seconds", 120);
 		if (now() - intval(st.checked_at, 0) < wait) return;
 		log("watchdog: retrying after failure");
-		let rr = do_connect(st.key, intval(st.index, 0), false);
+		let rr = do_connect(st.conn_id, false);
 		if (!rr.ok) state_patch({ state: "error", error: rr.error ?? "retry failed", checked_at: now() });
 		return;
 	}
 
 	if (st.state != "connected" && st.state != "connecting") return;
+	let c = resolve_target(st.conn_id ?? "");
+	if (c == null) {
+		routing_clear();
+		state_patch({ state: "error", error: "the connected profile was deleted", checked_at: now() });
+		return;
+	}
 
-	let s = sas_parse();
-	if (s.child) {
+	let p = drv_probe(c);
+	if (p.up) {
 		fix_resolv();
-		let vip = length(s.vip) ? s.vip : (st.vip ?? "");
-		let patch = { state: "connected", vip: vip, uptime: s.uptime, rx: s.rx, tx: s.tx, checked_at: now(), attempts: 0 };
-		if (cfg_bool("share_lan", true) && length(vip) && !routing_active(vip)) {
-		let rr = routing_apply(vip);
-		patch.routing_ok = rr.ok;
-		if (!rr.ok) log("watchdog: routing restore failed: " + (rr.error ?? "unknown"));
+		let vip = length(p.vip ?? "") ? p.vip : (st.vip ?? "");
+		let patch = { state: "connected", vip: vip, iface: p.iface ?? st.iface ?? "", uptime: p.uptime ?? 0, rx: p.rx ?? 0, tx: p.tx ?? 0, checked_at: now(), attempts: 0, misses: 0 };
+		if (cfg_bool("share_lan", true) && !routing_active(p.iface ?? "", vip)) {
+			let rr = routing_apply(p.iface ?? "", vip);
+			if (!rr.ok) log("watchdog: routing restore failed: " + (rr.error ?? "unknown"));
 			if (rr.ok) log("watchdog: routing rules restored");
 		}
 		state_patch(patch);
 		return;
 	}
 
-	// The child disappeared: either the peer dropped it or the WAN flapped.
+	// The tunnel disappeared: either the peer dropped it or the WAN flapped.
 	// A single miss can just be a rekey in progress, so require two in a row.
 	let misses = intval(st.misses, 0) + 1;
 	if (misses < 2) {
@@ -1061,7 +2028,6 @@ function supervise_once() {
 	let max = cfg_int("reconnect_attempts", 5);
 	log(sprintf("watchdog: tunnel lost (attempt %d/%d)", attempts, max));
 	routing_clear();
-	run("swanctl --terminate --ike " + CONN);
 
 	if (!cfg_bool("auto_reconnect", true) || attempts > max) {
 		state_patch({ state: "error", error: "tunnel lost", attempts: attempts, checked_at: now(), vip: "", rx: 0, tx: 0 });
@@ -1069,7 +2035,7 @@ function supervise_once() {
 	}
 
 	state_patch({ state: "connecting", attempts: attempts, misses: 0, checked_at: now() });
-	let r = do_connect(st.key, intval(st.index, 0), false);
+	let r = do_connect(st.conn_id, false);
 	if (!r.ok) state_patch({ state: "error", error: r.error ?? "reconnect failed", attempts: attempts, checked_at: now() });
 }
 
@@ -1077,6 +2043,7 @@ function supervise() {
 	ensure_dir(RUN);
 	ensure_dir(DATA);
 	ensure_dir(CHAINS);
+	ensure_dir(RUNDIR);
 	let st = state_read();
 	if (st.state == "connecting") state_patch({ state: "idle" });
 	log("supervisor started");
@@ -1100,7 +2067,58 @@ function supervise() {
 	}
 }
 
-// ---------------------------------------------------------------------- API
+// ------------------------------------------------------------ dependencies
+
+function deps_install() {
+	let m = missing_packages();
+	if (!length(m.packages)) return { ok: true, installed: [], note: "everything is already installed" };
+	let r = run("sh /usr/share/vpnexit/install-deps.sh " + join(" ", m.types));
+	let after = caps();
+	let still = [];
+	for (let t in missing_packages().types) push(still, t);
+	return {
+		ok: length(still) == 0,
+		installed: m.packages,
+		missing_types: still,
+		caps: after,
+		log: clean(r.out)
+	};
+}
+
+// -------------------------------------------------------------- manual test
+// "Test" brings the profile up, verifies the exit, then puts the previous
+// tunnel back.  It is the only call that connects and disconnects inside one
+// request, and it is therefore limited to the admin API.
+
+function test_impl(id) {
+	let prev = state_read();
+	let c = resolve_target(id);
+	if (c == null) return { ok: false, error: "unknown connection " + id };
+	if (!lock_acquire()) return { ok: false, error: "busy: another operation is running" };
+	let res;
+	try {
+		let conn = connect_impl(c, true);
+		if (!conn.ok) res = { ok: false, error: conn.error };
+		else {
+			let t = selftest_internal();
+			res = {
+				ok: t.ok, exit_ip: t.ip ?? "", direct_ip: t.direct ?? "",
+				detail: t.detail ?? "", vip: conn.vip, iface: conn.iface,
+				degraded: conn.degraded ?? ""
+			};
+		}
+		// Always leave the box as it was before the test.
+		disconnect_impl();
+		if (length(prev.conn_id ?? "") && prev.conn_id != id && prev.state == "connected") {
+			let pc = resolve_target(prev.conn_id);
+			if (pc != null) connect_impl(pc, false);
+		}
+	} catch (e) { res = { ok: false, error: "" + e }; }
+	lock_release();
+	return res;
+}
+
+// ------------------------------------------------------------------- HTTP API
 
 function jbody() {
 	let raw = fs.stdin.read("all") ?? "";
@@ -1116,6 +2134,45 @@ function respond(obj, code) {
 	if (code && code != 200) print(sprintf("Status: %d %s\r\n", code, code == 401 ? "Unauthorized" : "Error"));
 	print("Content-Type: application/json\r\nCache-Control: no-store\r\n\r\n");
 	print(sprintf("%J", obj));
+}
+
+function conn_from_body(b) {
+	let t = trim("" + (b.type ?? ""));
+	let found = false;
+	for (let x in TYPES) if (x == t) found = true;
+	if (!found) return { error: "unknown protocol " + t };
+	let cfg = {};
+	if (type(b.config) == "object" && b.config != null) {
+		for (let k in b.config) {
+			let v = b.config[k];
+			if (type(v) == "string" || type(v) == "int" || type(v) == "bool" || type(v) == "double")
+				cfg[k] = "" + v;
+		}
+	}
+	// Raw payloads get their own normalisation so a pasted file is usable as is.
+	if (t == "vless" && length(cfg.raw ?? "")) {
+		let v = vless_parse(cfg.raw);
+		if (length(v.error ?? "")) return { error: v.error };
+		cfg.host = v.host; cfg.port = "" + v.port; cfg.uuid = v.uuid;
+	}
+	if (t == "wireguard" || t == "amneziawg") {
+		let p = wg_parse(cfg.raw ?? "");
+		if (length(p.error)) return { error: p.error };
+		cfg.endpoint = p.peers[0] ? (p.peers[0].endpoint ?? "") : "";
+	}
+	if (t == "openvpn") {
+		if (!length(trim(cfg.raw ?? ""))) return { error: "paste the .ovpn file contents" };
+		cfg.endpoint = ovpn_summary(cfg.raw).remote;
+	}
+	let name = trim("" + (b.name ?? ""));
+	if (!length(name)) name = type_label(t) + " connection";
+	return {
+		id: trim("" + (b.id ?? "")),
+		type: t,
+		name: name,
+		config: cfg,
+		share_lan: b.share_lan == null ? true : boolval(b.share_lan, true)
+	};
 }
 
 function api() {
@@ -1163,6 +2220,14 @@ function api() {
 		return;
 	}
 	if (path == "status" && method == "GET") { respond({ ok: true, status: status_obj() }); return; }
+	if (path == "caps" && method == "GET") {
+		respond({ ok: true, caps: caps(), missing: missing_packages(), types: TYPES });
+		return;
+	}
+	if (path == "connections" && method == "GET") {
+		respond({ ok: true, items: connections_list(), active: state_read().conn_id ?? "" });
+		return;
+	}
 	if (path == "locations" && method == "GET") {
 		let q = getenv("QUERY_STRING") ?? "";
 		if (index(q, "refresh=1") >= 0) {
@@ -1198,12 +2263,70 @@ function api() {
 		if (b.token != null && length(trim("" + b.token)) >= 8) cfg_set("token", trim("" + b.token));
 		// Re-apply routing so MTU / IPv6 changes take effect immediately.
 		let st = state_read();
-		if (st.state == "connected" && length(st.vip ?? "") && cfg_bool("share_lan", true)) routing_apply(st.vip);
+		if (st.state == "connected" && cfg_bool("share_lan", true)) routing_apply(st.iface ?? "", st.vip ?? "");
 		if (st.state == "connected" && !cfg_bool("share_lan", true)) routing_clear();
 		respond({ ok: true, settings: settings_obj() });
 		return;
 	}
+	if (path == "connections-save" && method == "POST") {
+		let b = jbody();
+		let c = conn_from_body(b);
+		if (length(c.error ?? "")) { respond({ ok: false, error: c.error }); return; }
+		let doc = conns_load();
+		let existing = null;
+		if (length(c.id)) existing = find_conn(c.id);
+		if (existing == null) {
+			c.id = new_id();
+			c.created = now();
+			// Keep order stable: newest last, the panel sorts on its own.
+			push(doc.items, c);
+		} else {
+			c.created = existing.created ?? now();
+			let items = [];
+			for (let it in doc.items) push(items, it.id == c.id ? c : it);
+			doc.items = items;
+		}
+		conns_save(doc);
+		let prep = drv_prepare(c);
+		log(sprintf("save: %s (%s) %s", c.name, c.type, prep.ok ? "ok" : "invalid: " + prep.error));
+		respond({ ok: true, item: conn_view(c), valid: prep.ok, error: prep.ok ? "" : prep.error });
+		return;
+	}
+	if (path == "connections-delete" && method == "POST") {
+		let b = jbody();
+		let id = trim("" + (b.id ?? ""));
+		let doc = conns_load();
+		let keep = [], victim = null;
+		for (let it in doc.items) { if (it.id == id) victim = it; else push(keep, it); }
+		if (victim == null) { respond({ ok: false, error: "unknown connection" }); return; }
+		let st = state_read();
+		if (st.conn_id == id) disconnect_impl();
+		doc.items = keep;
+		conns_save(doc);
+		log("delete: " + (victim.name ?? id));
+		respond({ ok: true });
+		return;
+	}
+	if (path == "connection-connect" && method == "POST") {
+		let b = jbody();
+		let id = trim("" + (b.id ?? ""));
+		if (!length(id)) { respond({ ok: false, error: "missing id" }); return; }
+		if (resolve_target(id) == null) { respond({ ok: false, error: "unknown connection " + id }); return; }
+		if (worker_alive()) { respond({ ok: false, error: "busy: a connection attempt is already running" }); return; }
+		if (!start_worker(id)) { respond({ ok: false, error: "cannot start the connect worker" }); return; }
+		respond({ ok: true, async: true, id: id, state: "connecting" });
+		return;
+	}
+	if (path == "connection-test" && method == "POST") {
+		let b = jbody();
+		let id = trim("" + (b.id ?? ""));
+		if (!length(id)) { respond({ ok: false, error: "missing id" }); return; }
+		let r = test_impl(id);
+		respond(r);
+		return;
+	}
 	if (path == "connect" && method == "POST") {
+		// legacy endpoint used by the feed list
 		let b = jbody();
 		let key = trim("" + (b.key ?? ""));
 		if (!length(key)) { respond({ ok: false, error: "missing key" }); return; }
@@ -1212,7 +2335,7 @@ function api() {
 		let idx = intval(b.index, 0);
 		if (idx < 0 || idx >= length(loc.servers)) idx = 0;
 		if (worker_alive()) { respond({ ok: false, error: "busy: a connection attempt is already running" }); return; }
-		if (!start_worker(key, idx)) { respond({ ok: false, error: "cannot start the connect worker" }); return; }
+		if (!start_worker("loc:" + key + ":" + idx)) { respond({ ok: false, error: "cannot start the connect worker" }); return; }
 		respond({ ok: true, async: true, key: key, index: idx, state: "connecting" });
 		return;
 	}
@@ -1229,14 +2352,16 @@ function api() {
 		respond({ ok: r.ok, result: r });
 		return;
 	}
+	if (path == "deps-install" && method == "POST") { respond(deps_install()); return; }
 	respond({ ok: false, error: "unknown endpoint: " + path }, 404);
 }
 
-// -------------------------------------------------------------------- entry
+// ---------------------------------------------------------------------- CLI
 
 function main() {
 	ensure_dir(RUN);
 	ensure_dir(DATA);
+	ensure_dir(RUNDIR);
 	let argv = ARGV ?? [];
 	let cmd = argv[0] ?? "status";
 
@@ -1251,9 +2376,10 @@ function main() {
 	}
 	if (cmd == "status") {
 		let st = state_read();
-		let s = sas_parse();
-		if (st.state == "connected" || st.state == "connecting") {
-			state_patch({ uptime: s.uptime, rx: s.rx, tx: s.tx, vip: length(s.vip) ? s.vip : (st.vip ?? ""), checked_at: now() });
+		let c = length(st.conn_id ?? "") ? resolve_target(st.conn_id) : null;
+		if (c != null && (st.state == "connected" || st.state == "connecting")) {
+			let p = drv_probe(c);
+			state_patch({ uptime: p.uptime ?? 0, rx: p.rx ?? 0, tx: p.tx ?? 0, vip: length(p.vip ?? "") ? p.vip : (st.vip ?? ""), iface: p.iface ?? st.iface ?? "" });
 		}
 		print(sprintf("%J", status_obj()) + "\n");
 		return;
@@ -1263,28 +2389,68 @@ function main() {
 		print(sprintf("%J", { count: d.count, fetched_at: d.fetched_at, items: d.items }) + "\n");
 		return;
 	}
+	if (cmd == "connections") { print(sprintf("%J", connections_list()) + "\n"); return; }
+	if (cmd == "conn-save") {
+		// Scripted provisioning: vpnexit conn-save /tmp/conn.json
+		let file = argv[1] ?? "";
+		let body = {};
+		try { body = json(readfile(file)); } catch (e) { print(sprintf("%J", { ok: false, error: "cannot read " + file }) + "\n"); return; }
+		let c = conn_from_body(body ?? {});
+		if (length(c.error ?? "")) { print(sprintf("%J", { ok: false, error: c.error }) + "\n"); return; }
+		let doc = conns_load();
+		let existing = length(c.id) ? find_conn(c.id) : null;
+		if (existing == null) { c.id = new_id(); c.created = now(); push(doc.items, c); }
+		else {
+			c.created = existing.created ?? now();
+			let items = [];
+			for (let it in doc.items) push(items, it.id == c.id ? c : it);
+			doc.items = items;
+		}
+		conns_save(doc);
+		let prep = drv_prepare(c);
+		print(sprintf("%J", { ok: true, id: c.id, valid: prep.ok, error: prep.ok ? "" : prep.error }) + "\n");
+		return;
+	}
+	if (cmd == "conn-delete") {
+		let id = argv[1] ?? "";
+		let doc = conns_load();
+		let keep = [];
+		for (let it in doc.items) if (it.id != id) push(keep, it);
+		doc.items = keep;
+		conns_save(doc);
+		print(sprintf("%J", { ok: true, id: id }) + "\n");
+		return;
+	}
 	if (cmd == "connect") {
-		let key = argv[1] ?? "";
-		if (!length(key)) { print("usage: vpnexit connect <key> [index]\n"); return; }
-		print(sprintf("%J", do_connect(key, intval(argv[2], 0), true)) + "\n");
+		let id = argv[1] ?? "";
+		if (!length(id)) { print("usage: vpnexit connect <connection-id|loc:key:index> [--no-verify]\n"); return; }
+		print(sprintf("%J", do_connect(id, !(argv[2] == "--no-verify"))) + "\n");
 		return;
 	}
 	if (cmd == "job-connect") {
 		// Detached worker started by the panel: owns the lock until it is done.
-		let key = argv[1] ?? "";
-		let idx = intval(argv[2], 0);
-		let r = { ok: false, error: "no key" };
-		if (length(key)) {
-			try { r = connect_impl(key, idx, true); }
-			catch (e) { r = { ok: false, error: "" + e }; }
+		let id = argv[1] ?? "";
+		let r = { ok: false, error: "no id" };
+		if (length(id)) {
+			try {
+				let c = resolve_target(id);
+				if (c == null) r = { ok: false, error: "unknown connection " + id };
+				else r = connect_impl(c, true);
+			} catch (e) { r = { ok: false, error: "" + e }; }
 		}
 		lock_release();
+		return;
+	}
+	if (cmd == "test") {
+		let id = argv[1] ?? "";
+		print(sprintf("%J", test_impl(id)) + "\n");
 		return;
 	}
 	if (cmd == "disconnect") { print(sprintf("%J", do_disconnect()) + "\n"); return; }
 	if (cmd == "selftest") { print(sprintf("%J", selftest_internal()) + "\n"); return; }
 	if (cmd == "token") { print(cfg("token", "") + "\n"); return; }
-	if (cmd == "routing") { print(sprintf("%J", { active: routing_active(state_read().vip ?? "") }) + "\n"); return; }
+	if (cmd == "routing") { print(sprintf("%J", { active: routing_active(state_read().iface ?? "", state_read().vip ?? "") }) + "\n"); return; }
+	if (cmd == "caps") { print(sprintf("%J", { caps: caps(), missing: missing_packages() }) + "\n"); return; }
 	print("vpnexit: unknown command " + cmd + "\n");
 }
 

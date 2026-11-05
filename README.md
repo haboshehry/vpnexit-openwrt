@@ -1,200 +1,151 @@
-# vpnexit for OpenWrt
+# vpnexit
 
-A small web panel that lives on the router, downloads a daily IKEv2 profile
-feed, connects the router to the location you pick, and shares that exit with
-every wired and Wi-Fi client on the LAN.
+A single panel on an OpenWrt router that brings up **one VPN tunnel** and shares
+it with the LAN, without touching the router's own default route.
 
-* panel: `http://192.168.1.1/vpnexit/`
-* no Python, no Node, no jq — the backend is a single `ucode` script (ucode is
-  already part of LuCI, so nothing extra runs in the background)
-* the router keeps using its own uplink; only LAN traffic is steered
+Version 2 adds a manual mode: besides the profile feed, you can add your own
+profile for **IKEv2, L2TP/IPsec, SSTP, OpenVPN, WireGuard, AmneziaWG and
+VLESS/REALITY**, connect it, test the exit, and share it with the LAN.
 
 ```
-LAN/Wi-Fi client ──► router (nft mark 0x1a1)
-                        ├─ ip rule fwmark 0x1a1 → table 417
-                        ├─ SNAT to the address assigned by the peer
-                        ├─ ESP (IKEv2 / strongSwan) → VPN exit
-                        └─ router's own SSH/LuCI/DNS traffic stays on WAN
+        LAN clients                                          VPN server
+  192.168.68.0/24  ──►  nft mark 0x1a1  ──►  table 417  ──►  tunnel  ──►  internet
+                              │                                   ▲
+                       router itself stays on the WAN uplink ─────┘
 ```
+
+The router keeps its normal internet access: only forwarded LAN traffic (and
+DNS from the router) is marked, so SSH to the router keeps working while the
+tunnel is up.
+
+## Supported protocols
+
+| Type | Client used | Status |
+|------|-------------|--------|
+| IKEv2 (EAP-MSCHAPv2 or PSK) | strongSwan + swanctl | verified end to end |
+| WireGuard | kernel `wg` | verified end to end |
+| OpenVPN | `openvpn` (tun) | verified end to end |
+| L2TP/IPsec | strongSwan transport + `xl2tpd` | transport + PPP stage verified |
+| SSTP | `sstpc` + pppd | profile and error path verified, needs a live server |
+| AmneziaWG | `awg` when present, else `wg` | fallback verified |
+| VLESS / REALITY | `sing-box` (tun) | config + REALITY mapping verified |
+
+Notes:
+
+* **AmneziaWG** needs the `kmod-amneziawg` module, which is not in the official
+  OpenWrt feed. The panel detects it: with `awg` installed the obfuscation keys
+  are used, otherwise the profile runs as plain WireGuard and the panel shows
+  that the obfuscation parameters are ignored.
+* **OpenVPN**: on 25.12 `openvpn-openssl` depends on `kmod-ovpn-backports`,
+  which is not built for every target. `install-deps.sh` falls back to the
+  24.10 userland package (the missing module only carries the optional DCO
+  offload).
+* **VLESS** is handled by `sing-box`, which implements the same protocol and
+  REALITY. Paste a `vless://` URL, the panel parses it and generates the
+  outbound.
 
 ## Install
 
+On the router:
+
 ```sh
-scp vpnexit-openwrt.tar.gz root@192.168.1.1:/tmp/
-ssh root@192.168.1.1
-cd /tmp && tar xzf vpnexit-openwrt.tar.gz && sh vpnexit-openwrt/install.sh
+git clone https://github.com/haboshehry/vpnexit-openwrt /tmp/vpnexit
+cd /tmp/vpnexit
+sh install.sh              # files only
+sh install.sh --with-deps  # also install the VPN clients
 ```
 
-The installer is idempotent: it only adds missing packages, keeps
-`/etc/config/vpnexit` and the downloaded profile cache, then prints the panel
-URL and the admin token.
-
-Requirements: OpenWrt 24.10+ (the `apk` package manager), `ucode`, `nftables`
-(fw4). Tested on OpenWrt 25.12.6 / mips64 octeon.
-
-## Use
-
-1. Open `http://192.168.1.1/vpnexit/` and paste the token.
-2. Press **Refresh** if the list is empty.
-3. Pick a country. The panel connects, installs the routing rules, and
-   verifies the exit address. Every LAN/Wi-Fi device now uses that exit.
-4. **Disconnect** removes the rules and the tunnel; the router and the LAN
-   return to the normal uplink.
-
-CLI:
+The panel is then at `http://<router>/vpnexit/`. The first request asks for the
+token; it is printed by `install.sh` and stored in `/etc/config/vpnexit`
+(`token`). To read it again:
 
 ```sh
-vpnexit status
-vpnexit locations
-vpnexit connect free-netherlands 0
-vpnexit selftest
+uci get vpnexit.main.token
+```
+
+## Using the panel
+
+**Connections** — add one profile per VPN:
+
+| Field | Meaning |
+|-------|---------|
+| IKEv2 | server, username, password; optional remote ID and PSK (PSK mode replaces EAP) |
+| L2TP/IPsec | server, username, password, IPsec PSK |
+| SSTP | server, port, username, password |
+| OpenVPN | paste the `.ovpn` file, optional username/password |
+| WireGuard / AmneziaWG | paste the `wg.conf` / Amnezia config |
+| VLESS | paste the `vless://...` URL |
+
+`Connect` brings the tunnel up and applies the routing. `Test` connects,
+verifies the exit, and puts the previous tunnel back. `Disconnect` removes the
+tunnel and every rule it added.
+
+**Exit feed** — the daily profile feed, if `feed_url` is set. Each location is
+an IKEv2 profile with failover to the other servers of the same location.
+
+**Share with LAN** — on by default. When a tunnel is connected:
+
+* LAN forwarding is marked `0x1a1` and routed through table 417.
+* The tunnel interface gets a temporary `vpnexit` firewall zone, so `fw4`
+  accepts the forwarded traffic, and a `masquerade`/`snat` rule for the marked
+  packets.
+* DNS from the LAN is redirected to the router, and the router's own queries to
+  public resolvers are marked so they leave through the tunnel too. Queries to
+  the ISP resolver (a LAN address) are left alone.
+* IPv6 from the LAN is blocked while the tunnel is up, so nothing leaks around it.
+
+Turning the switch off removes the rules but keeps the tunnel up (the router
+itself can still use it).
+
+## CLI
+
+```sh
+vpnexit status                     # JSON status
+vpnexit connections                # configured profiles
+vpnexit connect <id|loc:key:0>     # connect synchronously
 vpnexit disconnect
+vpnexit selftest                   # compare direct and tunnel exit IP
+vpnexit conn-save /tmp/c.json      # provision a profile from JSON
+vpnexit conn-delete <id>
+vpnexit caps                       # which clients are installed
+vpnexit refresh                    # re-download the profile feed
 ```
 
-## Profile feed: fallback chain
+Connecting from the panel is asynchronous (the CGI request would time out), the
+panel polls `/api/status` while the worker runs.
 
-A failed download never leaves the panel without a list. The order is:
+## Health test
 
-1. **direct** — the router's own uplink
-2. **through the tunnel** — the request is marked and leaves via the VPN exit
-3. **through a relay** — an SSH host that can reach the feed, which downloads
-   it and pipes the body back
+`tests/loopback-test.sh` runs a server on the router itself for every protocol
+that can be tested locally (WireGuard handshake, OpenVPN TLS, VLESS, the L2TP
+PPP stage) and checks the real data path with a marked probe:
 
 ```sh
-uci set vpnexit.main.relay_enabled='1'
-uci set vpnexit.main.relay_list='root@203.0.113.10:22,root@198.51.100.5:2020'
-uci set vpnexit.main.relay_pass='…'      # used by sshpass, file is mode 600
-uci commit vpnexit
-vpnexit relay-test                        # {"rc":0,"note":"relay …","bytes":16277}
+sh tests/loopback-test.sh            # all
+sh tests/loopback-test.sh wireguard  # one
+VPX_BIN=/tmp/vpnexit.uc FEED_KEY=free-canada sh tests/loopback-test.sh ikev2
 ```
 
-Each relay is tried in order; the body must parse as JSON before it is accepted.
+The tests found two real bugs during development: a `lock` option that OpenWrt's
+`pppd` rejects (the L2TP profile failed to start PPP) and a point-to-point
+address parse that made every tun/ppp tunnel look like it had no address.
 
-## Settings (`/etc/config/vpnexit`)
+## Files
 
-| option | default | meaning |
-|---|---|---|
-| `feed_url` | the Firebase feed | JSON profile feed |
-| `refresh_hours` | `24` | how often the supervisor downloads the feed |
-| `share_lan` | `1` | steer LAN/Wi-Fi traffic through the tunnel |
-| `block_ipv6` | `1` | drop IPv6 forwarded from the LAN while the tunnel is up |
-| `auto_reconnect` | `1` | re-establish a dropped tunnel |
-| `reconnect_attempts` | `5` | attempts before giving up |
-| `tunnel_mtu` | `1400` | MSS is clamped to `mtu - 40` |
-| `mark` / `table` / `rule_priority` | `0x1a1` / `417` / `1000` | policy routing knobs |
-| `lan_iface` | auto (`br-lan`) | interface whose traffic is redirected |
-| `token` | generated | panel password |
-
-## How it works
-
-* **Profiles** — `uclient-fetch` pulls the feed, `ucode` normalises it
-  (`title_en`, country code derived from the key, premium flag, server list) and
-  caches it in `/etc/vpnexit/locations.json`.
-* **Trust** — the peers only send their leaf certificate inside IKE_AUTH, so the
-  issuer chain is learned once over TLS from the same host, the leaf name is
-  verified with `openssl x509 -checkhost`, and the issuers are stored as single
-  PEM files under `/etc/swanctl/x509ca/` (the pem plugin reads one cert per
-  file). The system CA bundle is split once at install time.
-* **Tunnel** — one swanctl connection (`vpnexit`) with EAP-MSCHAPv2, DPD every
-  30 s, wildcard traffic selectors. `charon` runs with `install_routes = no`
-  and `install_virtual_ip = no`; routing and NAT belong to the panel.
-* **Routing** — LAN packets are marked in `prerouting` (nftables), a dedicated
-  ip rule sends marked packets to table 417, that table only holds a default
-  route via the WAN gateway, and a `srcnat` rule rewrites the source to the
-  address the peer assigned. Conntrack reverses the NAT for the replies, so no
-  address has to be configured locally.
-* **Health** — the supervisor checks the CHILD_SA every 20 s, restores missing
-  rules, reconnects with a bounded retry count, and refreshes the feed once a
-  day.
-
-## Footprint
-
-Measured on the test device (2 × octeon, 400 MB RAM):
-
-* `charon` ≈ 4 MB RSS, supervisor (`ucode`) ≈ 2 MB RSS
-* panel assets ≈ 30 KB; no extra daemon — the panel is served by the existing
-  uhttpd on port 80 and its API is one CGI process per request
-* runtime state lives in `/var/run/vpnexit` (tmpfs), so there are no periodic
-  flash writes apart from the daily profile cache
-
-## Known issue: kernel panic on some vendor kernels
-
-While testing on **OpenWrt 25.12.6 / Ubiquiti USG (mips64 octeon)** the kernel
-panicked whenever `charon` installed the address the peer assigned
-(`install_virtual_ip = yes`) right before installing the CHILD_SA. Raw
-`ip xfrm` operations (state, policy, encap, replay, ESP output) and the ESP data
-path were verified to be stable on the same kernel, so the trigger is the
-address installation step performed by strongSwan.
-
-`install_virtual_ip = no` avoids it: the address is only used as the SNAT
-target, which is sufficient. That is the default written by the installer.
-
-A tunnel established with that setting carried real traffic (exit address
-`50.7.177.71` instead of the uplink `38.180.210.34`, ESP counters increasing).
-If you see a reboot during connect on a different device, check
-`/etc/strongswan.d/vpnexit.conf` first.
-
-Two more things were needed before connects became stable on that device:
-
-1. `strongswan-mod-kernel-libipsec` must not be active. With the plugin loaded
-   (the OpenWrt package enables it by default) the very same connect hung the
-   router even though `install_virtual_ip = no` was set. The installer now
-   disables it explicitly and the panel re-checks at start-up.
-2. nftables chain names cannot be reserved words: `mark`, `redirect` and
-   friends are statements, so the generated ruleset uses `vpx_*` names.
-
-Both are covered by the tests below; `vpnexit status` reports
-`routing.active = true` and a verified `exit_ip` when everything is healthy.
+```
+/etc/config/vpnexit            settings (token, feed, mark, table, mtu)
+/etc/vpnexit/connections.json  manual profiles (0600)
+/etc/vpnexit/run/<id>/         generated config and logs per profile
+/usr/share/vpnexit/vpnexit.uc  backend (ucode), CLI + CGI API
+/usr/share/vpnexit/install-deps.sh
+/www/cgi-bin/vpnexit           CGI entry point
+/www/vpnexit/                  panel
+/var/run/vpnexit/state.json    current tunnel state
+```
 
 ## Uninstall
 
 ```sh
-sh /tmp/vpnexit-openwrt/uninstall.sh
+sh uninstall.sh          # removes the panel and its files
+apk del openvpn-openssl sing-box sstp-client xl2tpd wireguard-tools   # optional
 ```
-
-Keeps `/etc/config/vpnexit`; pass `--purge` to remove the configuration and the
-profile cache as well.
-
-## Where to click
-
-* **LuCI top bar** — a `VPN Exit` entry is added next to Status / System /
-  Network (`admin/vpnexit`) and also under *Services*. It opens the panel
-  inside LuCI, with a "open in a new tab" button.
-* **Panel** — `http://192.168.1.1/vpnexit/` (works on the HTTPS listener too).
-* **Backend source** — `/usr/share/vpnexit/vpnexit.uc` is outside the web
-  root, so a path such as `/files/usr/share/vpnexit/vpnexit.uc` can never work
-  (uhttpd has no such route). Use one of:
-
-```
-http://192.168.1.1/vpnexit/source.txt               # static, read-only copy
-/cgi-bin/vpnexit/api/source?t=TOKEN                 # JSON {path, bytes, text}
-/cgi-bin/vpnexit/api/source?raw=1&t=TOKEN           # text/plain
-```
-
-  or the `</>` button in the panel header.
-## Install on Debian / Ubuntu / Raspberry Pi / RaspAP
-
-The `portable/` folder contains a Python 3 build (no ucode) that serves the same
-panel and API on port 8088 and runs as two systemd services.
-
-```sh
-git clone <repo> /tmp/vpnexit
-cd /tmp/vpnexit && sh portable/install-debian.sh
-```n
-It installs strongswan-swanctl, nftables, curl, sshpass, python3; writes
-`/etc/vpnexit/config.json`; splits the system CA store for the pem plugin; enables
-IP forwarding; and prints the panel URL plus the admin token.
-
-On a **RaspAP** host set `lan_iface` to the AP interface (usually `wlan0`) if
-wireless clients are not redirected:
-
-```sh
-python3 - <<'PY'
-import json
-p='/etc/vpnexit/config.json'
-c=json.load(open(p)); c['lan_iface']='wlan0'; json.dump(c,open(p,'w'),indent=1)
-PY
-systemctl restart vpnexit-supervisor
-```n
-Services: `vpnexit-web` (panel), `vpnexit-supervisor` (watchdog + daily feed).
-Logs: `journalctl -u vpnexit-supervisor -f`.
