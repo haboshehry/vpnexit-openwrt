@@ -1848,7 +1848,7 @@ function disconnect_impl() {
 	if (c != null) drv_down(c);
 	else ike_down();
 	fix_resolv();
-	state_patch({ state: "idle", conn_id: "", iface: "", vip: "", exit_ip: "", error: "", warning: "", degraded: "", server_ip: "", rx: 0, tx: 0, uptime: 0, checked_at: now() });
+	state_patch({ state: "idle", conn_id: "", name: "", type: "", flag: "", source: "", server: "", iface: "", vip: "", exit_ip: "", error: "", warning: "", degraded: "", server_ip: "", rx: 0, tx: 0, uptime: 0, checked_at: now() });
 	return { ok: true };
 }
 
