@@ -757,7 +757,7 @@ function caps() {
 		openvpn: has_bin("/usr/sbin/openvpn"),
 		wireguard: has_bin("/usr/bin/wg"),
 		amneziawg: has_bin("/usr/bin/awg") || has_bin("/usr/bin/wg"),
-		vless: has_bin("/usr/bin/sing-box")
+		vless: has_bin("/usr/bin/xray")
 	};
 }
 
@@ -768,7 +768,7 @@ const PKG_FOR_TYPE = {
 	openvpn: "openvpn-openssl",
 	wireguard: "wireguard-tools kmod-wireguard",
 	amneziawg: "wireguard-tools kmod-wireguard",
-	vless: "sing-box"
+	vless: "xray-core"
 };
 
 function missing_packages() {
@@ -938,7 +938,7 @@ function vless_parse(uri) {
 	return {
 		uuid: uuid, host: host, port: port,
 		flow: p.flow ?? "", security: p.security ?? "none", sni: p.sni ?? p.host ?? host,
-		fp: p.fp ?? "chrome", pbk: p.pbk ?? "", sid: p.sid ?? "", spx: p.spx ?? "/",
+		fp: p.fp ?? "chrome", pbk: p.pbk ?? "", sid: p.sid ?? "", spx: p.spx ?? "/", pqv: p.pqv ?? "",
 		net: p.type ?? "tcp", path: p.path ?? "/", host_header: p.host ?? "",
 		service: p.serviceName ?? "", alpn: p.alpn ?? "", allow_insecure: boolval(p.allowinsecure, false),
 		raw: uri
@@ -1405,91 +1405,136 @@ function wg_probe() {
 }
 
 // ---------------------------------------------------------- VLESS / REALITY
+// Xray is the client here, not sing-box: this server uses the post-quantum
+// REALITY variant, where the URL carries pqv (an ML-DSA-65 key) that has to be
+// verified by the client. sing-box has no equivalent and fails with
+// "reality verification failed".
+//
+// Xray has no tun inbound, so the marked LAN traffic is handed to a local
+// dokodemo-door socket with TPROXY instead of being routed into an interface.
+// That also means no masquerade is needed: xray dials the server itself.
 
-function sb_config(c) {
-	let s = c.config ?? {};
-	let v = vless_parse(s.raw ?? "");
-	if (length(v.error ?? "")) return { error: v.error };
-	let ob = {
-		type: "vless",
-		tag: "proxy",
-		server: v.host,
-		server_port: v.port,
-		uuid: v.uuid
+const XRAY_PROXY_PORT = 12345;
+const XRAY_HTTP_PORT = 18081;
+const TPROXY_TABLE = 100;
+
+function xc_outbound(v) {
+	let rs = {
+		serverName: v.sni,
+		fingerprint: length(v.fp) ? v.fp : "chrome",
+		publicKey: v.pbk,
+		shortId: v.sid
 	};
-	if (length(v.flow)) ob.flow = v.flow;
-	if (v.net == "ws" || v.net == "grpc" || v.net == "httpupgrade") {
-		let tr = { type: v.net };
-		if (v.net == "ws") { tr.path = length(v.path) ? v.path : "/"; if (length(v.host_header)) tr.headers = { Host: v.host_header }; }
-		if (v.net == "grpc") tr.service_name = v.service;
-		if (v.net == "httpupgrade") tr.path = length(v.path) ? v.path : "/";
-		ob.transport = tr;
-	}
-	let tls = { enabled: true, server_name: v.sni };
+	if (length(v.spx)) rs.spiderX = v.spx;
+	// pqv is the post-quantum public key of the server; without it the
+	// handshake is refused by the peer.
+	if (length(v.pqv)) rs.mldsa65Verify = v.pqv;
+
+	let users = { id: v.uuid, encryption: "none" };
+	if (length(v.flow)) users.flow = v.flow;
+
+	let stream = { network: "tcp" };
 	if (v.security == "reality") {
-		tls.utls = { enabled: true, fingerprint: length(v.fp) ? v.fp : "chrome" };
-		tls.reality = { enabled: true, public_key: v.pbk, short_id: v.sid };
+		stream.security = "reality";
+		stream.realitySettings = rs;
 	} else if (v.security == "tls") {
-		tls.utls = { enabled: true, fingerprint: length(v.fp) ? v.fp : "chrome" };
-		if (boolval(v.allow_insecure, false)) tls.insecure = true;
+		// Xray 26 removed allowInsecure on purpose; a TLS profile therefore
+		// needs a certificate the router can validate.
+		stream.security = "tls";
+		stream.tlsSettings = { serverName: v.sni };
 	} else {
-		tls.enabled = false;
+		stream.security = "none";
 	}
-	if (tls.enabled) ob.tls = tls;
+	if (v.net == "ws") {
+		stream.network = "ws";
+		stream.wsSettings = { path: length(v.path) ? v.path : "/" };
+		if (length(v.host_header)) stream.wsSettings.headers = { Host: v.host_header };
+	} else if (v.net == "grpc") {
+		stream.network = "grpc";
+		stream.grpcSettings = { serviceName: v.service };
+	}
+
 	return {
-		ok: true,
-		cfg: {
-			log: { level: "warn", timestamp: true },
-			inbounds: [{
-				type: "tun", tag: "tun-in", interface_name: VLESSIFACE,
-				address: ["172.19.66.1/30"], mtu: cfg_int("tunnel_mtu", 1400) + 20,
-				auto_route: false, strict_route: false, stack: "system"
-			}],
-			outbounds: [ob, { type: "direct", tag: "direct" }],
-			// auto_detect_interface makes sing-box bind every outbound socket to
-			// the detected default device, which fails with EPERM on this
-			// firmware.  vpnexit does the interface selection itself.
-			route: { rules: [{ action: "sniff" }], final: "proxy", auto_detect_interface: false }
-		}
+		tag: "proxy",
+		protocol: "vless",
+		settings: { vnext: [{ address: v.host, port: v.port, users: [users] }] },
+		streamSettings: stream
+	};
+}
+
+function xc_config(v) {
+	// routeOnly keeps the sniffed destination from being rewritten, which is
+	// what TPROXY needs; the http inbound exists only for the health check.
+	return {
+		log: { loglevel: "warning" },
+		inbounds: [
+			{
+				tag: "tproxy-in", listen: "127.0.0.1", port: XRAY_PROXY_PORT, protocol: "dokodemo-door",
+				settings: { network: "tcp,udp", followRedirect: true },
+				streamSettings: { sockopt: { tproxy: "tproxy" } },
+				sniffing: { enabled: true, destOverride: ["http", "tls"], routeOnly: true }
+			},
+			{ tag: "http-in", listen: "127.0.0.1", port: XRAY_HTTP_PORT, protocol: "http" }
+		],
+		outbounds: [xc_outbound(v), { tag: "direct", protocol: "freedom" }]
 	};
 }
 
 function vless_prepare(c) {
-	let r = sb_config(c);
-	if (length(r.error ?? "")) return { ok: false, error: r.error };
+	let v = vless_parse((c.config ?? {}).raw ?? "");
+	if (length(v.error ?? "")) return { ok: false, error: v.error };
+	if (v.security == "reality" && !length(v.pbk))
+		return { ok: false, error: "the URL has no pbk, so REALITY cannot be verified" };
+	if (v.security == "reality" && !length(v.sid))
+		return { ok: false, error: "the URL has no sid (short id)" };
 	let d = conn_runtime_dir(c.id);
-	writefile(d + "/singbox.json", sprintf("%J", r.cfg), "0600");
-	let chk = run(sprintf("sing-box check -c %s", shellq(d + "/singbox.json")));
-	if (chk.rc != 0) return { ok: false, error: "sing-box rejected the configuration: " + clean(chk.out) };
-	return { ok: true, endpoint: c.config.host + ":" + c.config.port };
+	writefile(d + "/xray.json", sprintf("%J", xc_config(v)), "0600");
+	let chk = run(sprintf("xray run -test -c %s", shellq(d + "/xray.json")));
+	if (chk.rc != 0) return { ok: false, error: "xray rejected the configuration: " + clean(chk.out) };
+	return { ok: true, endpoint: v.host + ":" + v.port };
+}
+
+// Exit IP as seen through the local http inbound. BusyBox wget ignores
+// http_proxy for https, so the check uses plain http.
+function http_inbound_ip(seconds) {
+	let r = run(sprintf("http_proxy=http://127.0.0.1:%d wget -q -O - --timeout=%d http://icanhazip.com",
+		XRAY_HTTP_PORT, seconds ?? 6));
+	let ip = trim(r.out ?? "");
+	if (match(ip, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)) return ip;
+	return "";
 }
 
 function vless_up(c) {
 	let d = conn_runtime_dir(c.id);
-	kill_pidfile(d + "/singbox.pid");
-	run("ip link del " + VLESSIFACE + " 2>/dev/null");
-	spawn_bg(sprintf("sing-box run -c %s", shellq(d + "/singbox.json")), d + "/singbox.log", d + "/singbox.pid");
-	if (!wait_iface(VLESSIFACE, 20)) {
-		kill_pidfile(d + "/singbox.pid");
-		return { ok: false, error: "sing-box did not create the tunnel: " + log_tail(d + "/singbox.log", 5) };
+	kill_pidfile(d + "/xray.pid");
+	kill_match(d + "/xray.json");
+	sleep(200);
+	spawn_bg(sprintf("xray run -c %s", shellq(d + "/xray.json")), d + "/xray.log", d + "/xray.pid");
+	let ip = "";
+	for (let i = 0; i < 8 && !length(ip); i++) {
+		sleep(700);
+		ip = http_inbound_ip(5);
 	}
-	return { ok: true, iface: VLESSIFACE, vip: iface_v4(VLESSIFACE), xfrm: false };
+	if (!length(ip)) {
+		kill_pidfile(d + "/xray.pid");
+		return { ok: false, error: "the VLESS handshake failed: " + log_tail(d + "/xray.log", 4) };
+	}
+	return { ok: true, iface: "", vip: "", tproxy: true, port: XRAY_PROXY_PORT, exit_ip: ip };
 }
 
 function vless_down(c) {
 	let d = RUNDIR + "/" + replace(c.id ?? "", /[^A-Za-z0-9_-]/g, "_");
-	kill_pidfile(d + "/singbox.pid");
-	kill_match(d + "/singbox.json");
-	sleep(300);
-	run("ip link del " + VLESSIFACE + " 2>/dev/null");
+	kill_pidfile(d + "/xray.pid");
+	kill_match(d + "/xray.json");
 }
 
 function vless_probe() {
-	if (!iface_exists(VLESSIFACE)) return { up: false };
-	let v4 = iface_v4(VLESSIFACE);
-	if (!length(v4)) return { up: false };
-	let b = iface_bytes(VLESSIFACE);
-	return { up: true, iface: VLESSIFACE, vip: v4, rx: b.rx, tx: b.tx, uptime: 0 };
+	let st = state_read();
+	let pidfile = RUNDIR + "/" + replace(st.conn_id ?? "", /[^A-Za-z0-9_-]/g, "_") + "/xray.pid";
+	let pid = intval(trim(readfile(pidfile)), 0);
+	if (pid <= 0) return { up: false };
+	if (run(sprintf("kill -0 %d 2>/dev/null", pid)).rc != 0) return { up: false };
+	return { up: true, iface: "", vip: "", tproxy: true, port: XRAY_PROXY_PORT, rx: 0, tx: 0, uptime: 0 };
 }
 
 // --------------------------------------------------------------- dispatchers
@@ -1653,7 +1698,79 @@ function zone_remove() {
 	log("routing: firewall zone removed");
 }
 
-function routing_apply(iface, vip) {
+// TPROXY variant: the packets are not routed into a device, they are handed to
+// a local socket. Only the mark and the local route are needed, and no NAT rule
+// at all, because the proxy dials the server with the router's own address.
+function routing_tproxy_apply(port) {
+	let lan = lan_iface();
+	let dr = default_route();
+	if (!dr.dev) return { ok: false, error: "cannot determine the WAN interface" };
+	let smark = cfg("mark", "0x1a1");
+	let lan_cidr = mask4(iface_cidr(lan)) ?? "192.168.1.0/24";
+	let wan_cidr = mask4(iface_cidr(dr.dev)) ?? "";
+	let st = state_read();
+	let server = st.server_ip ?? "";
+	if (!length(server) && length(st.server ?? "")) {
+		let host = split(st.server, ":")[0] ?? "";
+		server = resolve4(host);
+	}
+	let excl = ["127.0.0.0/8", "224.0.0.0/4", "255.255.255.255/32", lan_cidr];
+	if (length(wan_cidr)) push(excl, wan_cidr);
+	if (length(server)) push(excl, server + "/32");
+
+	let t = [];
+	push(t, "table inet vpnexit {");
+	push(t, "\tset exclude4 {");
+	push(t, "\t\ttype ipv4_addr");
+	push(t, "\t\tflags interval");
+	push(t, "\t\tauto-merge");
+	push(t, sprintf("\t\telements = { %s }", join(", ", excl)));
+	push(t, "\t}");
+	push(t, "\tchain vpx_tproxy {");
+	push(t, "\t\ttype filter hook prerouting priority mangle; policy accept;");
+	push(t, sprintf("\t\tiifname != \"%s\" return", lan));
+	push(t, "\t\tip daddr @exclude4 return");
+	push(t, "\t\tudp dport 53 return");
+	push(t, "\t\ttcp dport 53 return");
+	push(t, sprintf("\t\tmeta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set %s counter", port, smark));
+	push(t, "\t}");
+	push(t, "\tchain vpx_dnsredirect {");
+	push(t, "\t\ttype nat hook prerouting priority dstnat; policy accept;");
+	push(t, sprintf("\t\tiifname \"%s\" udp dport 53 redirect to :53", lan));
+	push(t, sprintf("\t\tiifname \"%s\" tcp dport 53 redirect to :53", lan));
+	push(t, "\t}");
+	if (cfg_bool("block_ipv6", true)) {
+		push(t, "\tchain vpx_v6 {");
+		push(t, "\t\ttype filter hook forward priority filter; policy accept;");
+		push(t, sprintf("\t\tiifname \"%s\" oifname \"%s\" meta nfproto ipv6 drop", lan, dr.dev));
+		push(t, "\t}");
+	}
+	push(t, "}");
+
+	ensure_dir(RUN);
+	let path = RUN + "/last.nft";
+	fs.writefile(path, join("\n", t) + "\n");
+	let chk = run("nft -c -f " + shellq(path));
+	if (chk.rc != 0) return { ok: false, error: "ruleset rejected: " + clean(chk.out) };
+	let batch = "";
+	if (table_exists("inet vpnexit")) batch += "delete table inet vpnexit\n";
+	fs.writefile(RUN + "/apply.nft", batch + join("\n", t) + "\n");
+	let ap = run("nft -f " + shellq(RUN + "/apply.nft"));
+	if (ap.rc != 0) return { ok: false, error: "cannot apply rules: " + clean(ap.out) };
+
+	// A TRANSPARENT socket is only reachable when the packet is marked and the
+	// mark sends it to the local table.
+	for (let i = 0; i < 4; i++)
+		run(sprintf("ip rule del fwmark %s lookup %d", smark, TPROXY_TABLE));
+	let ar = run(sprintf("ip rule add fwmark %s lookup %d priority %d", smark, TPROXY_TABLE, cfg_int("rule_priority", 1000)));
+	if (ar.rc != 0) return { ok: false, error: "cannot add the tproxy rule: " + clean(ar.out) };
+	run(sprintf("ip route replace local 0.0.0.0/0 dev lo table %d", TPROXY_TABLE));
+	log(sprintf("routing: tproxy on 127.0.0.1:%d for %s", port, lan));
+	return { ok: true, tproxy: true };
+}
+
+function routing_apply(iface, vip, tproxy_port) {
+	if (intval(tproxy_port, 0) > 0) return routing_tproxy_apply(intval(tproxy_port, 0));
 	let xfrm = !length(iface);
 	if (!xfrm && !iface_exists(iface)) return { ok: false, error: "interface " + iface + " is not up" };
 	if (xfrm && !length(vip)) return { ok: false, error: "tunnel has no address yet" };
@@ -1719,15 +1836,27 @@ function routing_clear() {
 	run("nft delete table inet vpnexit");
 	run("nft delete table ip vpnexit_nat");
 	run("nft delete table inet vpnexit_probe");
-	for (let i = 0; i < 4; i++)
+	for (let i = 0; i < 4; i++) {
 		run(sprintf("ip rule del fwmark %s lookup %d priority %d", mark, table, prio));
+		run(sprintf("ip rule del fwmark %s lookup %d", mark, TPROXY_TABLE));
+	}
 	run(sprintf("ip route flush table %d", table));
+	run(sprintf("ip route flush table %d", TPROXY_TABLE));
 	zone_remove();
 }
 
-function routing_active(iface, vip) {
-	if (!length(iface) && !length(vip)) return false;
+// The state decides which shape the rules should have: an interface tunnel uses
+// the default route in table 417, a TPROXY proxy only needs the mark + local
+// route. Both are checked here so the watchdog can repair either one.
+function routing_active() {
+	let st = state_read();
 	if (!table_exists("inet vpnexit")) return false;
+	if (intval(st.tproxy, 0) > 0) {
+		if (run(sprintf("ip rule show | grep -q 'fwmark %s lookup %d'", cfg("mark", "0x1a1"), TPROXY_TABLE)).rc != 0) return false;
+		if (run(sprintf("ip route show table %d | grep -q local", TPROXY_TABLE)).rc != 0) return false;
+		return true;
+	}
+	if (!length(st.iface ?? "") && !length(st.vip ?? "")) return false;
 	if (run(sprintf("ip rule show | grep -q 'fwmark %s lookup %d'", cfg("mark", "0x1a1"), cfg_int("table", 417))).rc != 0) return false;
 	if (run(sprintf("ip route show table %d | grep -q default", cfg_int("table", 417))).rc != 0) return false;
 	return true;
@@ -1756,10 +1885,21 @@ function selftest_internal() {
 	let c = resolve_target(st.conn_id ?? "");
 	if (c == null) return { ok: false, detail: "the connected profile is gone" };
 	let down_rules = false;
-	if (cfg_bool("share_lan", true) && !routing_active(st.iface ?? "", st.vip ?? "")) {
-		let rr = routing_apply(st.iface ?? "", st.vip ?? "");
+	if (cfg_bool("share_lan", true) && !routing_active()) {
+		let rr = routing_apply(st.iface ?? "", st.vip ?? "", st.tproxy ?? 0);
 		if (!rr.ok) return { ok: false, detail: rr.error };
 		down_rules = true;
+	}
+	// The proxy path cannot be checked with a marked probe: TPROXY only matches
+	// forwarded LAN traffic, so the exit is measured through the local http
+	// inbound instead and compared with the same endpoint used directly.
+	if (intval(st.tproxy, 0) > 0) {
+		let via = http_inbound_ip(8);
+		let plain = trim(run("wget -q -O - --timeout=6 http://icanhazip.com").out);
+		if (down_rules) routing_clear();
+		if (!length(via)) return { ok: false, detail: "no answer through the proxy", direct: plain };
+		if (length(plain) && plain == via) return { ok: false, detail: "traffic still leaves through the router uplink", direct: plain };
+		return { ok: true, ip: via, direct: plain, detail: "exit verified" };
 	}
 	let direct = probe_ip(false);
 	let marked = probe_ip(true);
@@ -1817,7 +1957,8 @@ function connect_impl(c, verify) {
 	}
 	state_patch({
 		state: "connected", iface: up.iface ?? "", vip: up.vip ?? "",
-		xfrm: up.xfrm ? 1 : 0, degraded: up.degraded ?? "",
+		xfrm: up.xfrm ? 1 : 0, tproxy: up.tproxy ? (up.port ?? 0) : 0,
+		degraded: up.degraded ?? "", exit_ip: up.exit_ip ?? "",
 		server: up.server ?? conn_endpoint(c), server_ip: up.remote ?? "",
 		since: now(), misses: 0, attempts: 0, checked_at: now()
 	});
@@ -1825,7 +1966,7 @@ function connect_impl(c, verify) {
 
 	let routing = { active: false };
 	if (cfg_bool("share_lan", true)) {
-		let rr = routing_apply(up.iface ?? "", up.vip ?? "");
+		let rr = routing_apply(up.iface ?? "", up.vip ?? "", up.tproxy ? (up.port ?? 0) : 0);
 		routing.active = rr.ok;
 		if (!rr.ok) log("connect: routing failed: " + rr.error);
 	}
@@ -1857,20 +1998,6 @@ function disconnect_impl() {
 // supervisor may fire at the same moment, which would otherwise race on the
 // nftables table and the tunnel.
 
-function lock_acquire() {
-	let dir = RUN + "/lock";
-	for (let i = 0; i < 20; i++) {
-		if (run("mkdir " + shellq(dir) + " 2>/dev/null").rc == 0) return true;
-		// Never wait for a lock whose owner is gone: the web server kills long
-		// running requests, which used to leave the directory behind.
-		if (!worker_alive()) { run("rm -rf " + shellq(dir)); continue; }
-		sleep(300);
-	}
-	return false;
-}
-
-function lock_release() { run("rm -rf " + shellq(RUN + "/lock")); }
-
 // The worker PID is stored by the API process ($$ of the spawned shell), so a
 // simple SIG 0 test tells us whether an operation is really still running.
 function worker_alive() {
@@ -1879,6 +2006,21 @@ function worker_alive() {
 	if (pid <= 0) return false;
 	return run(sprintf("kill -0 %d 2>/dev/null", pid)).rc == 0;
 }
+function lock_acquire() {
+	let dir = RUN + "/lock";
+	for (let i = 0; i < 20; i++) {
+		if (run("mkdir " + shellq(dir) + " 2>/dev/null").rc == 0) return true;
+		// Never wait for a lock whose owner is gone: the web server kills long
+		// running requests, which used to leave the directory behind.
+		if (worker_alive() != true) { run("rm -rf " + shellq(dir)); continue; }
+		sleep(300);
+	}
+	return false;
+}
+
+function lock_release() { run("rm -rf " + shellq(RUN + "/lock")); }
+
+
 
 // Connecting can take longer than uhttpd's script timeout, so the API hands the
 // work to a detached worker and answers immediately; the panel polls /status.
@@ -1940,7 +2082,7 @@ function status_obj() {
 		uptime: intval(st.uptime, 0),
 		rx: intval(st.rx, 0),
 		tx: intval(st.tx, 0),
-		routing: { active: routing_active(st.iface ?? "", st.vip ?? ""), share_lan: cfg_bool("share_lan", true) },
+		routing: { active: routing_active(), share_lan: cfg_bool("share_lan", true) },
 		since: intval(st.since, 0)
 	};
 	if (st.source == "feed" && length(st.conn_id ?? "")) {
@@ -2007,8 +2149,8 @@ function supervise_once() {
 		fix_resolv();
 		let vip = length(p.vip ?? "") ? p.vip : (st.vip ?? "");
 		let patch = { state: "connected", vip: vip, iface: p.iface ?? st.iface ?? "", uptime: p.uptime ?? 0, rx: p.rx ?? 0, tx: p.tx ?? 0, checked_at: now(), attempts: 0, misses: 0 };
-		if (cfg_bool("share_lan", true) && !routing_active(p.iface ?? "", vip)) {
-			let rr = routing_apply(p.iface ?? "", vip);
+		if (cfg_bool("share_lan", true) && !routing_active()) {
+			let rr = routing_apply(p.iface ?? "", vip, st.tproxy ?? 0);
 			if (!rr.ok) log("watchdog: routing restore failed: " + (rr.error ?? "unknown"));
 			if (rr.ok) log("watchdog: routing rules restored");
 		}
@@ -2263,7 +2405,7 @@ function api() {
 		if (b.token != null && length(trim("" + b.token)) >= 8) cfg_set("token", trim("" + b.token));
 		// Re-apply routing so MTU / IPv6 changes take effect immediately.
 		let st = state_read();
-		if (st.state == "connected" && cfg_bool("share_lan", true)) routing_apply(st.iface ?? "", st.vip ?? "");
+		if (st.state == "connected" && cfg_bool("share_lan", true)) routing_apply(st.iface ?? "", st.vip ?? "", st.tproxy ?? 0);
 		if (st.state == "connected" && !cfg_bool("share_lan", true)) routing_clear();
 		respond({ ok: true, settings: settings_obj() });
 		return;
@@ -2449,7 +2591,7 @@ function main() {
 	if (cmd == "disconnect") { print(sprintf("%J", do_disconnect()) + "\n"); return; }
 	if (cmd == "selftest") { print(sprintf("%J", selftest_internal()) + "\n"); return; }
 	if (cmd == "token") { print(cfg("token", "") + "\n"); return; }
-	if (cmd == "routing") { print(sprintf("%J", { active: routing_active(state_read().iface ?? "", state_read().vip ?? "") }) + "\n"); return; }
+	if (cmd == "routing") { print(sprintf("%J", { active: routing_active() }) + "\n"); return; }
 	if (cmd == "caps") { print(sprintf("%J", { caps: caps(), missing: missing_packages() }) + "\n"); return; }
 	print("vpnexit: unknown command " + cmd + "\n");
 }

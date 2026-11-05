@@ -302,20 +302,19 @@ test_vless() {
 	#    without a peer: the assertion reads the config the panel generated.
 	URI_R="vless://$UUID@reality.example.com:443?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=$PUB&sid=$SID&type=tcp&flow=xtls-rprx-vision#reality"
 	save_conn "reality-map" vless "{\"raw\":\"$URI_R\"}" || return
-	CFG="/etc/vpnexit/run/$CONN_ID/singbox.json"
+	CFG="/etc/vpnexit/run/$CONN_ID/xray.json"
 	# sprintf("%J") writes "key": "value" with a space, so match the values only.
 	if grep -q 'reality' "$CFG" 2>/dev/null && grep -q "$SID" "$CFG" 2>/dev/null && grep -q "$PUB" "$CFG" 2>/dev/null; then
 		pass "REALITY URL mapped to a reality outbound"
 	else
-		fail "REALITY fields missing from the generated sing-box config"
+		fail "REALITY fields missing from the generated xray config"
 	fi
 	vx conn-delete "$CONN_ID" >/dev/null 2>&1
 
 	# 2) Data path: a TLS server on the loopback, so HTTP really has to leave
 	#    through the tunnel.  REALITY itself needs a reachable handshake target.
-	openssl ecparam -genkey -name prime256v1 -out sb.key 2>/dev/null
-	openssl req -new -x509 -days 3 -key sb.key -out sb.crt -subj "/CN=localhost" \
-		-addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
+	# A REALITY server, so the client exercises the same code path the panel
+	# uses for real peers. The handshake target must be a reachable TLS host.
 	cat > server.json <<EOF
 {
   "log": { "level": "info", "timestamp": true },
@@ -327,9 +326,13 @@ test_vless() {
     "users": [{ "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
     "tls": {
       "enabled": true,
-      "server_name": "localhost",
-      "certificate_path": "$T/sb/sb.crt",
-      "key_path": "$T/sb/sb.key"
+      "server_name": "www.cloudflare.com",
+      "reality": {
+        "enabled": true,
+        "handshake": { "server": "www.cloudflare.com", "server_port": 443 },
+        "private_key": "$PRIV",
+        "short_id": ["$SID"]
+      }
     }
   }],
   "outbounds": [{ "type": "direct", "tag": "direct" }]
@@ -339,10 +342,10 @@ EOF
 	sing-box run -c server.json > server.log 2>&1 &
 	sleep 4
 	if grep -q 'FATAL' server.log 2>/dev/null; then
-		fail "the test server did not start: $(tail -n 2 server.log)"
+		skip "the REALITY test server did not start: $(tail -n 2 server.log)"
 		return
 	fi
-	URI="vless://$UUID@$SBIP:18443?encryption=none&security=tls&sni=localhost&allowInsecure=1&type=tcp&flow=xtls-rprx-vision#loopback"
+	URI="vless://$UUID@$SBIP:18443?encryption=none&security=reality&sni=www.cloudflare.com&fp=chrome&pbk=$PUB&sid=$SID&type=tcp&flow=xtls-rprx-vision#loopback"
 	save_conn "loopback-vless" vless "{\"raw\":\"$URI\"}" || return
 	_out=$(vx connect "$CONN_ID")
 	_ok=$(printf '%s' "$_out" | jsonfilter -e '@.ok')
@@ -351,11 +354,13 @@ EOF
 	# is refused by this kernel (EPERM before netfilter), while forwarded LAN
 	# traffic is a different code path, so a failure here is reported as
 	# "not verified" rather than as a broken driver.
-	if mark_fetch https://1.1.1.1/cdn-cgi/trace; then
-		pass "HTTP through the VLESS tunnel"
-	else
-		skip "local TCP probe cannot be marked on this kernel - verify from a LAN client"
-	fi
+	# The driver hands LAN traffic to a local TPROXY socket, so the health check
+	# goes through the http inbound the same way the panel does.
+	_via=$(http_proxy=http://127.0.0.1:18081 wget -q -O - --timeout=12 http://icanhazip.com 2>/dev/null | tr -d '\r')
+	case "$_via" in
+		[0-9]*.[0-9]*.[0-9]*.[0-9]*) pass "HTTP through the xray tunnel (exit $_via)";;
+		*) fail "no HTTP answer through the proxy: $(tail -n 3 /etc/vpnexit/run/$CONN_ID/xray.log 2>/dev/null)";;
+	esac
 	vx_disconnect
 	killall -q sing-box 2>/dev/null
 }

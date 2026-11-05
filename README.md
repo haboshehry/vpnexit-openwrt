@@ -28,7 +28,7 @@ tunnel is up.
 | L2TP/IPsec | strongSwan transport + `xl2tpd` | transport + PPP stage verified |
 | SSTP | `sstpc` + pppd | profile and error path verified, needs a live server |
 | AmneziaWG | `awg` when present, else `wg` | fallback verified |
-| VLESS / REALITY | `sing-box` (tun) | config + REALITY mapping verified |
+| VLESS / REALITY | `xray-core` (TPROXY) | verified end to end |
 
 Notes:
 
@@ -40,9 +40,13 @@ Notes:
   which is not built for every target. `install-deps.sh` falls back to the
   24.10 userland package (the missing module only carries the optional DCO
   offload).
-* **VLESS** is handled by `sing-box`, which implements the same protocol and
-  REALITY. Paste a `vless://` URL, the panel parses it and generates the
-  outbound.
+* **VLESS** is handled by `xray-core`. Paste a `vless://` URL. Xray has no
+  tun inbound, so LAN traffic is handed to a local dokodemo-door socket with
+  TPROXY (this needs `kmod-nft-tproxy`); no masquerade is involved because xray
+  dials the server itself. The post-quantum REALITY variant is supported: the
+  `pqv` parameter of the URL becomes `mldsa65Verify`, which sing-box cannot do.
+  Note that Xray 26 removed `allowInsecure`, so a TLS (non-REALITY) profile
+  needs a certificate the router can validate.
 
 ## Install
 

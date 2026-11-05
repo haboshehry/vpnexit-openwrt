@@ -43,7 +43,7 @@ if has_type wireguard || has_type amneziawg; then
 	add_pkgs "kmod-wireguard wireguard-tools"
 fi
 if has_type vless; then
-	add_pkgs "sing-box"
+	add_pkgs "xray-core kmod-nft-tproxy"
 fi
 
 apk update >/dev/null 2>&1 || say "apk update failed, using the cached index"
