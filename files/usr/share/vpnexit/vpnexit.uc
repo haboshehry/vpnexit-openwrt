@@ -1308,74 +1308,158 @@ function ovpn_probe() {
 }
 
 // ------------------------------------------------------ WireGuard/AmneziaWG
+//
+// AmneziaWG is not "WireGuard with a different name": the handshake headers,
+// paddings and junk packets are changed, and a plain WireGuard client is
+// silently dropped by an AmneziaWG server.  The kernel module is not in the
+// OpenWrt feed, so the panel runs the userspace implementation
+// (amneziawg-go) and pushes the obfuscation parameters through its UAPI socket.
+// That needs socat.
+//
+// Order of preference:
+//   amneziawg kernel module + awg   -> native, fastest
+//   amneziawg-go + socat            -> real obfuscation, userspace
+//   wg only                         -> plain WireGuard, clearly reported
 
-// Amnezia exports an "AmneziaWG" profile that is a WireGuard configuration plus
-// obfuscation keys (Jc/Jmin/Jmax/S1/S2/H1..H4).  The kernel module that
-// understands those keys is not part of the official OpenWrt feed, so the panel
-// uses it when present (awg) and otherwise falls back to plain WireGuard with a
-// visible warning instead of failing silently.
+function awg_go_bin() {
+	if (has_bin("/usr/sbin/amneziawg-go")) return "/usr/sbin/amneziawg-go";
+	if (has_bin("/usr/bin/amneziawg-go")) return "/usr/bin/amneziawg-go";
+	return "";
+}
+
+function awg_mode(c) {
+	if (c.type != "amneziawg") return "kernel";
+	if (has_bin("/usr/bin/awg")) return "kernel-awg";
+	if (length(awg_go_bin()) && has_bin("/usr/bin/socat")) return "userspace";
+	return "fallback";
+}
+
 function wg_tool(c) {
-	if (c.type == "amneziawg" && has_bin("/usr/bin/awg")) return "/usr/bin/awg";
+	if (c.type == "amneziawg" && awg_mode(c) == "kernel-awg") return "/usr/bin/awg";
 	return "/usr/bin/wg";
 }
 
 function wg_degraded(c) {
 	if (c.type != "amneziawg") return "";
-	if (has_bin("/usr/bin/awg")) return "";
-	return "AmneziaWG module not installed - running as plain WireGuard; obfuscation parameters are ignored";
+	if (awg_mode(c) != "fallback") return "";
+	return "amneziawg-go is not installed - running as plain WireGuard, the obfuscation parameters are ignored";
 }
 
 function wg_parse_cfg(c) {
-	let p = wg_parse((c.config ?? {}).raw ?? "");
-	if (length(p.error)) return p;
-	return p;
+	return wg_parse((c.config ?? {}).raw ?? "");
+}
+
+// The UAPI speaks hex, the configuration files speak base64.
+function wg_hex(v) {
+	let d = RUNDIR + "/hex.tmp";
+	fs.writefile(d, trim(v ?? ""));
+	let r = run("openssl base64 -d -A < " + shellq(d) + " | hexdump -v -e '1/1 \"%02x\"'");
+	fs.unlink(d);
+	return trim(r.out);
+}
+
+// UAPI block for the userspace daemon.  Key names are the ones amneziawg-go
+// parses in device/uapi.go.
+function awg_uapi(p, mode) {
+	let lines = ["set=1", "private_key=" + wg_hex(p.iface.privatekey)];
+	if (length(p.iface.listenport ?? "")) push(lines, "listen_port=" + p.iface.listenport);
+	if (mode == "userspace" || mode == "kernel-awg") {
+		for (let k in ["jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5"]) {
+			if (length(p.iface[k] ?? "")) push(lines, k + "=" + p.iface[k]);
+		}
+	}
+	push(lines, "replace_peers=true");
+	for (let peer in p.peers) {
+		push(lines, "public_key=" + wg_hex(peer.publickey ?? ""));
+		if (length(peer.presharedkey ?? "")) push(lines, "preshared_key=" + wg_hex(peer.presharedkey));
+		if (length(peer.endpoint ?? "")) push(lines, "endpoint=" + peer.endpoint);
+		for (let a in split_addresses(peer.allowedips ?? "")) push(lines, "allowed_ip=" + a);
+		if (length(peer.persistentkeepalive ?? "")) push(lines, "persistent_keepalive_interval=" + peer.persistentkeepalive);
+	}
+	return join("\n", lines) + "\n";
 }
 
 function wg_prepare(c) {
 	let p = wg_parse_cfg(c);
 	if (length(p.error)) return { ok: false, error: p.error };
+	if (!length(p.peers[0].endpoint ?? "")) return { ok: false, error: "the [Peer] section has no Endpoint" };
 	let d = conn_runtime_dir(c.id);
-	let lines = ["[Interface]", "PrivateKey = " + p.iface.privatekey];
-	if (length(p.iface.listenport ?? "")) push(lines, "ListenPort = " + p.iface.listenport);
-	if (length(p.iface.fwmark ?? "")) push(lines, "FwMark = " + p.iface.fwmark);
-	// The obfuscation keys only exist in the AmneziaWG tool.  Passing them to
-	// plain wg would abort the whole configuration, so they are written only
-	// when awg is the tool that will consume the file.
-	if (c.type == "amneziawg" && wg_tool(c) == "/usr/bin/awg") {
-		for (let k in ["jc", "jmin", "jmax", "s1", "s2", "h1", "h2", "h3", "h4"]) {
-			if (length(p.iface[k] ?? "")) push(lines, uc(k) + " = " + p.iface[k]);
+	let mode = awg_mode(c);
+
+	if (mode == "userspace") {
+		writefile(d + "/awg.uapi", awg_uapi(p, mode), "0600");
+	} else {
+		let lines = ["[Interface]", "PrivateKey = " + p.iface.privatekey];
+		if (length(p.iface.listenport ?? "")) push(lines, "ListenPort = " + p.iface.listenport);
+		if (mode == "kernel-awg") {
+			for (let k in ["jc", "jmin", "jmax", "s1", "s2", "h1", "h2", "h3", "h4"]) {
+				if (length(p.iface[k] ?? "")) push(lines, uc(k) + " = " + p.iface[k]);
+			}
 		}
-	}
-	for (let peer in p.peers) {
+		for (let peer in p.peers) {
+			push(lines, "");
+			push(lines, "[Peer]");
+			push(lines, "PublicKey = " + (peer.publickey ?? ""));
+			if (length(peer.presharedkey ?? "")) push(lines, "PresharedKey = " + peer.presharedkey);
+			if (length(peer.allowedips ?? "")) push(lines, "AllowedIPs = " + peer.allowedips);
+			if (length(peer.endpoint ?? "")) push(lines, "Endpoint = " + peer.endpoint);
+			if (length(peer.persistentkeepalive ?? "")) push(lines, "PersistentKeepalive = " + peer.persistentkeepalive);
+		}
 		push(lines, "");
-		push(lines, "[Peer]");
-		push(lines, "PublicKey = " + (peer.publickey ?? ""));
-		if (length(peer.presharedkey ?? "")) push(lines, "PresharedKey = " + peer.presharedkey);
-		if (length(peer.allowedips ?? "")) push(lines, "AllowedIPs = " + peer.allowedips);
-		if (length(peer.endpoint ?? "")) push(lines, "Endpoint = " + peer.endpoint);
-		if (length(peer.persistentkeepalive ?? "")) push(lines, "PersistentKeepalive = " + peer.persistentkeepalive);
+		writefile(d + "/wg.conf", join("\n", lines), "0600");
 	}
-	push(lines, "");
-	writefile(d + "/wg.conf", join("\n", lines), "0600");
+
 	let addrs = split_addresses(p.iface.address ?? "");
-	let mtu = intval(p.iface.mtu, 0);
 	writefile(d + "/meta.json", sprintf("%J", {
-		addrs: addrs, mtu: mtu, tool: wg_tool(c), degraded: wg_degraded(c),
-		endpoint: p.peers[0] ? (p.peers[0].endpoint ?? "") : ""
+		addrs: addrs, mtu: intval(p.iface.mtu, 0), mode: mode,
+		tool: wg_tool(c), degraded: wg_degraded(c),
+		obfuscated: (length(p.iface.jc ?? "") || length(p.iface.h1 ?? "")),
+		endpoint: p.peers[0].endpoint ?? ""
 	}), "0600");
-	return { ok: true, endpoint: p.peers[0] ? (p.peers[0].endpoint ?? "") : "", degraded: wg_degraded(c) };
+	return { ok: true, endpoint: p.peers[0].endpoint ?? "", degraded: wg_degraded(c) };
 }
 
 function wg_up(c) {
 	let d = conn_runtime_dir(c.id);
 	let meta;
 	try { meta = json(readfile(d + "/meta.json")); } catch (e) { return { ok: false, error: "run save first" }; }
-	let tool = meta.tool ?? "/usr/bin/wg";
-	if (!has_bin(tool)) return { ok: false, error: "neither wg nor awg is installed" };
+	let mode = meta.mode ?? "kernel";
+
 	run("ip link del " + WGIFACE + " 2>/dev/null");
-	let add = run("ip link add " + WGIFACE + " type wireguard");
-	if (add.rc != 0) return { ok: false, error: "cannot create a WireGuard interface: " + clean(add.out) };
-	let set = run(sprintf("%s setconf %s %s", tool, WGIFACE, shellq(d + "/wg.conf")));
+
+	if (mode == "userspace") {
+		let bin = awg_go_bin();
+		kill_pidfile(d + "/awg.pid");
+		kill_match(bin + " -f " + WGIFACE);
+		spawn_bg(sprintf("%s -f %s", bin, WGIFACE), d + "/awg.log", d + "/awg.pid");
+		let sock = "/var/run/amneziawg/" + WGIFACE + ".sock";
+		let ready = false;
+		for (let i = 0; i < 25; i++) {
+			if (fs.stat(sock)) { ready = true; break; }
+			sleep(200);
+		}
+		if (!ready) return { ok: false, error: "amneziawg-go did not create its socket: " + log_tail(d + "/awg.log", 4) };
+
+		for (let a in meta.addrs ?? []) run(sprintf("ip addr add %s dev %s", shellq(a), WGIFACE));
+		let mtu = intval(meta.mtu, 0);
+		if (mtu <= 0) mtu = cfg_int("tunnel_mtu", 1400);
+		run(sprintf("ip link set mtu %d up dev %s", mtu, WGIFACE));
+
+		let r = run(sprintf("socat -t 4 - UNIX-CONNECT:%s < %s", shellq(sock), shellq(d + "/awg.uapi")));
+		if (index(r.out, "errno=0") < 0) {
+			return { ok: false, error: "the obfuscated configuration was rejected: " + clean(r.out) };
+		}
+		if (!wait_iface(WGIFACE, 8)) {
+			return { ok: false, error: "the interface has no address - add one to the [Interface] Address line" };
+		}
+		return { ok: true, iface: WGIFACE, vip: iface_v4(WGIFACE), xfrm: false, degraded: meta.degraded ?? "" };
+	}
+
+	if (!has_bin(meta.tool ?? "/usr/bin/wg")) return { ok: false, error: "neither wg nor awg is installed" };
+	let kind = mode == "kernel-awg" ? "amneziawg" : "wireguard";
+	let add = run(sprintf("ip link add %s type %s", WGIFACE, kind));
+	if (add.rc != 0) return { ok: false, error: "cannot create the interface: " + clean(add.out) };
+	let set = run(sprintf("%s setconf %s %s", meta.tool, WGIFACE, shellq(d + "/wg.conf")));
 	if (set.rc != 0) {
 		run("ip link del " + WGIFACE + " 2>/dev/null");
 		return { ok: false, error: "the peer configuration was rejected: " + clean(set.out) };
@@ -1392,7 +1476,8 @@ function wg_up(c) {
 
 function wg_down(c) {
 	let d = RUNDIR + "/" + replace(c.id ?? "", /[^A-Za-z0-9_-]/g, "_");
-	if (fs.stat(d + "/wg.conf")) run("ip link del " + WGIFACE + " 2>/dev/null");
+	kill_pidfile(d + "/awg.pid");
+	if (length(awg_go_bin())) kill_match(awg_go_bin() + " -f " + WGIFACE);
 	run("ip link del " + WGIFACE + " 2>/dev/null");
 }
 
@@ -1403,6 +1488,7 @@ function wg_probe() {
 	let b = iface_bytes(WGIFACE);
 	return { up: true, iface: WGIFACE, vip: v4, rx: b.rx, tx: b.tx, uptime: 0 };
 }
+
 
 // ---------------------------------------------------------- VLESS / REALITY
 // Xray is the client here, not sing-box: this server uses the post-quantum
@@ -1873,10 +1959,18 @@ function probe_ip(marked) {
 		run("nft add chain inet vpnexit_probe out '{ type route hook output priority mangle; policy accept; }'");
 		run("nft add rule inet vpnexit_probe out ip daddr 1.1.1.1 meta mark set " + cfg("mark", "0x1a1"));
 	}
+	// Some OpenWrt builds have a uclient-fetch TLS stack that cannot complete
+	// the 1.1.1.1 HTTPS probe.  Keep it as the preferred check, but fall back
+	// to the plain-HTTP endpoint so health checks still work on BusyBox-only
+	// images.  The mark applies to both commands and is removed afterwards.
 	let r = run("uclient-fetch -q -O - --timeout=12 " + shellq(PROBE));
-	if (marked) run("nft delete table inet vpnexit_probe");
 	let m = match(r.out, /ip=([0-9.]+)/);
-	return m ? m[1] : "";
+	if (!m) {
+		r = run("wget -q -O - --timeout=12 http://icanhazip.com");
+		m = match(trim(r.out ?? ""), /^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$/);
+	}
+	if (marked) run("nft delete table inet vpnexit_probe");
+	return m ? (m[1] ?? m[0]) : "";
 }
 
 function selftest_internal() {
