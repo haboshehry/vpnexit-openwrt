@@ -91,6 +91,13 @@ chmod 0644 /www/vpnexit/* /usr/share/vpnexit/* 2>/dev/null || true
 cp /usr/share/vpnexit/vpnexit.uc /www/vpnexit/source.txt
 chmod 0644 /www/vpnexit/source.txt
 
+# A browser that keeps the previous app.js also keeps the previous capability
+# warnings, so the asset URLs carry the release version as a cache key.
+if [ -f /www/vpnexit/index.html ]; then
+	ver=$(cat /usr/share/vpnexit/VERSION 2>/dev/null)
+	sed -i -E "s#(href|src)=\"(style\.css|app\.js)(\?v=[^\"]*)?\"#\1=\"\2?v=$ver\"#" /www/vpnexit/index.html
+fi
+
 # --------------------------------------------------------- 2b. VPN clients
 # The optional clients come from the same script the panel calls, so a target
 # where one of them cannot be installed (openvpn needs a kmod that is not built

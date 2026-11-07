@@ -127,9 +127,14 @@
   }
 
   function api(path, body, method) {
-    var opt = { method: method || (body ? "POST" : "GET"), headers: {}, credentials: "same-origin" };
+    var opt = { method: method || (body ? "POST" : "GET"), headers: {}, credentials: "same-origin", cache: "no-store" };
     if (body) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
-    return fetch(API + path, opt).then(function (r) {
+    // A browser can keep an old GET answer (for example an outdated capability
+    // list) and show a warning that no longer matches the router.  Every GET
+    // carries a unique query string so only the current state is rendered.
+    var url = API + path;
+    if (!body) url += (url.indexOf("?") < 0 ? "?" : "&") + "_=" + Date.now();
+    return fetch(url, opt).then(function (r) {
       if (r.status === 401) { askToken(); throw new Error("unauthorized"); }
       return r.json();
     });
@@ -506,6 +511,11 @@
     document.documentElement.dir = lang === "fa" ? "rtl" : "ltr";
     $("lang").textContent = lang === "en" ? "FA" : "EN";
     refreshAll().then(function () { loadFeed(); poll(); setInterval(refreshAll, 20000); });
+    // Return to the tab: re-read the capability list instead of trusting the
+    // state from when the page was first opened.
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) refreshAll();
+    });
   }
 
   if (state.token) {
