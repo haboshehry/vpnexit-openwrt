@@ -15,7 +15,8 @@ PKGS="ucode ucode-mod-fs ucode-mod-uci uclient-fetch \
  strongswan-mod-eap-mschapv2 strongswan-mod-eap-identity \
  kmod-ipsec4 kmod-ipsec6 kmod-crypto-gcm kmod-crypto-authenc \
  kmod-crypto-sha256 kmod-crypto-hmac kmod-crypto-ctr kmod-crypto-aead \
- kmod-crypto-cbc kmod-crypto-echainiv kmod-crypto-seqiv ip-full openssl-util sshpass openssh-client"
+ kmod-crypto-cbc kmod-crypto-echainiv kmod-crypto-seqiv ip-full openssl-util \
+ sshpass openssh-client socat wget-ssl"
 
 [ "$(id -u)" = "0" ] || { echo "run as root" >&2; exit 1; }
 [ -f /etc/openwrt_release ] || { echo "this is not OpenWrt" >&2; exit 1; }
@@ -25,18 +26,55 @@ echo "==> vpnexit installer"
 echo "    $DISTRIB_DESCRIPTION ($DISTRIB_ARCH)"
 
 # ---------------------------------------------------------------- 1. packages
-if ! command -v apk >/dev/null 2>&1; then
-	echo "!! apk package manager not found (OpenWrt < 24.10 is not supported)" >&2
+# 24.10 still ships opkg, 25.x uses apk.  Both are supported: the package names
+# are the same, only the query/install commands differ.
+if command -v apk >/dev/null 2>&1; then
+	PM=apk
+elif command -v opkg >/dev/null 2>&1; then
+	PM=opkg
+else
+	echo "!! neither apk nor opkg was found, cannot install the dependencies" >&2
 	exit 1
 fi
+
+pkg_present() {
+	if [ "$PM" = "apk" ]; then
+		apk info -e "$1" >/dev/null 2>&1
+	else
+		opkg list-installed 2>/dev/null | grep -q "^$1 "
+	fi
+}
+
+pkg_install() {
+	if [ "$PM" = "apk" ]; then
+		apk add -q "$@"
+	else
+		opkg install "$@"
+	fi
+}
+
+echo "==> package manager: $PM"
 missing=""
 for p in $PKGS; do
-	apk info -e "$p" >/dev/null 2>&1 || missing="$missing $p"
+	pkg_present "$p" || missing="$missing $p"
 done
 if [ -n "$missing" ]; then
 	echo "==> installing packages:$missing"
+	[ "$PM" = "opkg" ] && { opkg update >/dev/null 2>&1 || echo "    (opkg update failed, using the cached index)"; }
 	# shellcheck disable=SC2086
-	apk add -q $missing || { echo "!! package installation failed" >&2; exit 1; }
+	if ! pkg_install $missing; then
+		# A single package missing from the feed (e.g. a kmod not built for this
+		# target) must not abort the installation; the panel reports what is left.
+		failed=""
+		for p in $missing; do
+			pkg_present "$p" && continue
+			pkg_install "$p" >/dev/null 2>&1 || failed="$failed $p"
+		done
+		if [ -n "$failed" ]; then
+			echo "!! could not install:$failed" >&2
+			echo "!! continuing, the panel will list the missing clients" >&2
+		fi
+	fi
 else
 	echo "==> packages already present"
 fi
