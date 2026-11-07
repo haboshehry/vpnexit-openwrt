@@ -69,6 +69,10 @@ if has_type sstp; then
 fi
 if has_type wireguard || has_type amneziawg; then
 	add_pkgs "kmod-wireguard wireguard-tools"
+	# AmneziaWG needs the userspace daemon when the target has no
+	# amneziawg kernel module.  The installer itself only provides the
+	# protocol client; the target-specific binary is installed below.
+	add_pkgs "socat"
 fi
 if has_type vless; then
 	add_pkgs "xray-core kmod-nft-tproxy"
@@ -176,4 +180,37 @@ command -v openvpn >/dev/null 2>&1 && say "openvpn: $(openvpn --version 2>/dev/n
 command -v wg >/dev/null 2>&1 && say "wireguard: $(wg --version 2>/dev/null)"
 command -v sing-box >/dev/null 2>&1 && say "sing-box: $(sing-box version 2>/dev/null | head -n 1)"
 command -v sstpc >/dev/null 2>&1 && say "sstp-client: $(sstpc --version 2>&1 | head -n 1)"
+
+install_awg_go() {
+	# A packaged kernel module is preferred.  Userspace is the portable path
+	# for targets such as octeon/mips64 where no amneziawg module is shipped.
+	if command -v awg >/dev/null 2>&1; then
+		return 0
+	fi
+	if command -v amneziawg-go >/dev/null 2>&1; then
+		return 0
+	fi
+	ARCH=""
+	[ -f /etc/openwrt_release ] && . /etc/openwrt_release
+	ARCH="${DISTRIB_ARCH:-}"
+	case "$ARCH" in
+		mips64*|mips64el*) AWG_ARCH=mips64 ;;
+		arm_cortex-a7*|arm_cortex-a9*|arm_cortex-a15*) AWG_ARCH=arm ;;
+		aarch64*) AWG_ARCH=arm64 ;;
+		x86_64) AWG_ARCH=amd64 ;;
+		*) say "no bundled amneziawg-go binary for $ARCH"; return 1 ;;
+	esac
+	# The release artifact is shipped with the vpnexit bundle at install time.
+	# Do not download an arbitrary binary from the network.
+	if [ -f /usr/share/vpnexit/amneziawg-go-$AWG_ARCH ]; then
+		install -m 0755 /usr/share/vpnexit/amneziawg-go-$AWG_ARCH /usr/sbin/amneziawg-go
+		return 0
+	fi
+	say "amneziawg-go binary missing for $ARCH"
+	return 1
+}
+
+if has_type amneziawg; then
+	install_awg_go || say "amneziawg userspace daemon unavailable"
+fi
 exit 0
