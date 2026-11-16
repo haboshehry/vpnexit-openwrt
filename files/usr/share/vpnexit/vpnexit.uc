@@ -1367,6 +1367,22 @@ function awg_uapi(p, mode) {
 		for (let k in ["jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5"]) {
 			if (length(p.iface[k] ?? "")) push(lines, k + "=" + p.iface[k]);
 		}
+		// AmneziaWG 3.x parameters.  The panel writes them in the .conf file, but
+		// they only reach the daemon through the UAPI socket, so they have to be
+		// forwarded here as well - without them the handshake is rejected by a
+		// 3.x server even though jc/s1/h1 match.
+		if (length(p.iface.headerprotectionkey ?? ""))
+			push(lines, "header_protection_key=" + wg_hex(p.iface.headerprotectionkey));
+		for (let pair in ["contentpaddingaddition:content_padding_addition", "rekeyaftertime:rekey_after_time",
+			"rekeytimeout:rekey_timeout", "rejectaftertime:reject_after_time", "keepalivetimeout:keepalive_timeout",
+			"maxhandshakeattempts:max_handshake_attempts"]) {
+			let kv = split(pair, ":");
+			if (length(p.iface[kv[0]] ?? "")) push(lines, kv[1] + "=" + p.iface[kv[0]]);
+		}
+		for (let pair in ["randomtrailers:random_trailers", "disablecookies:disable_cookies"]) {
+			let kv = split(pair, ":");
+			if (length(p.iface[kv[0]] ?? "")) push(lines, kv[1] + "=" + (boolval(p.iface[kv[0]], false) ? "true" : "false"));
+		}
 	}
 	push(lines, "replace_peers=true");
 	for (let peer in p.peers) {
@@ -1392,7 +1408,10 @@ function wg_prepare(c) {
 		let lines = ["[Interface]", "PrivateKey = " + p.iface.privatekey];
 		if (length(p.iface.listenport ?? "")) push(lines, "ListenPort = " + p.iface.listenport);
 		if (mode == "kernel-awg") {
-			for (let k in ["jc", "jmin", "jmax", "s1", "s2", "h1", "h2", "h3", "h4"]) {
+			for (let k in ["jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4",
+				"i1", "i2", "i3", "i4", "i5", "headerprotectionkey", "contentpaddingaddition",
+				"rekeyaftertime", "rekeytimeout", "rejectaftertime", "keepalivetimeout",
+				"maxhandshakeattempts", "randomtrailers", "disablecookies"]) {
 				if (length(p.iface[k] ?? "")) push(lines, uc(k) + " = " + p.iface[k]);
 			}
 		}

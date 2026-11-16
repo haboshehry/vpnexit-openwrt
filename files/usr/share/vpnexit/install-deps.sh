@@ -203,7 +203,9 @@ install_awg_go() {
 	# The release artifact is shipped with the vpnexit bundle at install time.
 	# Do not download an arbitrary binary from the network.
 	if [ -f /usr/share/vpnexit/amneziawg-go-$AWG_ARCH ]; then
-		install -m 0755 /usr/share/vpnexit/amneziawg-go-$AWG_ARCH /usr/sbin/amneziawg-go
+		# BusyBox on OpenWrt has no "install"; cp + chmod works everywhere.
+		cp -f /usr/share/vpnexit/amneziawg-go-$AWG_ARCH /usr/sbin/amneziawg-go
+		chmod 0755 /usr/sbin/amneziawg-go
 		return 0
 	fi
 	say "amneziawg-go binary missing for $ARCH"
