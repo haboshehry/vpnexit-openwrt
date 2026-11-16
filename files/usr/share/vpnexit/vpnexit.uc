@@ -2084,6 +2084,24 @@ function probe_nat_del() {
 	run("nft delete table ip vpnexit_probe_nat");
 }
 
+// Only the probe endpoints are marked.  Marking every public destination also
+// captured the resolver traffic, so the lookup failed before the request even
+// left and a working tunnel looked dead.
+function probe_addrs(host) {
+	let out = [];
+	let r = run("nslookup " + shellq(host) + " 127.0.0.1 2>/dev/null");
+	for (let line in split(r.out ?? "", "\n")) {
+		let m = match(line, /Address:?[ \t]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
+		if (!m) continue;
+		let ip = m[1];
+		if (index(ip, "127.") == 0 || index(ip, "10.") == 0 || index(ip, "192.168.") == 0) continue;
+		let dup = false;
+		for (let e in out) if (e == ip) dup = true;
+		if (!dup) push(out, ip);
+	}
+	return out;
+}
+
 function probe_ip(marked, iface, mark) {
 	let routed = false;
 	if (marked) {
@@ -2095,7 +2113,12 @@ function probe_ip(marked, iface, mark) {
 		let s_ip = state_read().server ?? "";
 		let ep_host = split(s_ip, ":")[0] ?? "";
 		if (length(ep_host)) run("nft add rule inet vpnexit_probe out ip daddr " + ep_host + " return");
-		run("nft add rule inet vpnexit_probe out meta mark set " + mark);
+		let eps = probe_addrs("ipv4.icanhazip.com");
+		if (length(eps)) {
+			run("nft add rule inet vpnexit_probe out ip daddr { " + join(", ", eps) + " } meta mark set " + mark);
+		} else {
+			run("nft add rule inet vpnexit_probe out meta mark set " + mark);
+		}
 		// IKEv2 owns no interface: the published LAN routing plus the panel's
 		// own SNAT are the path, so only the mark is needed here.
 		if (length(iface ?? "")) {
