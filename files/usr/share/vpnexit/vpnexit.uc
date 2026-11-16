@@ -1577,6 +1577,8 @@ function xc_outbound(v) {
 	};
 }
 
+const XRAY_DNS_PORT = 1053;
+
 function xc_config(v) {
 	// routeOnly keeps the sniffed destination from being rewritten, which is
 	// what TPROXY needs; the http inbound exists only for the health check.
@@ -1588,6 +1590,10 @@ function xc_config(v) {
 				settings: { network: "tcp,udp", followRedirect: true },
 				streamSettings: { sockopt: { tproxy: "tproxy" } },
 				sniffing: { enabled: true, destOverride: ["http", "tls"], routeOnly: true }
+			},
+			{
+				tag: "dns-in", listen: "127.0.0.1", port: XRAY_DNS_PORT, protocol: "dokodemo-door",
+				settings: { address: "1.1.1.1", port: 53, network: "tcp,udp", followRedirect: false }
 			},
 			{ tag: "http-in", listen: "127.0.0.1", port: XRAY_HTTP_PORT, protocol: "http" }
 		],
@@ -1634,7 +1640,7 @@ function vless_up(c) {
 		kill_pidfile(d + "/xray.pid");
 		return { ok: false, error: "the VLESS handshake failed: " + log_tail(d + "/xray.log", 4) };
 	}
-	return { ok: true, iface: "", vip: "", tproxy: true, port: XRAY_PROXY_PORT, exit_ip: ip };
+	return { ok: true, iface: "", vip: "", tproxy: true, port: XRAY_PROXY_PORT, dns_port: XRAY_DNS_PORT, exit_ip: ip };
 }
 
 function vless_down(c) {
@@ -2037,6 +2043,72 @@ function selftest_internal() {
 // which makes busybox nslookup and dnsmasq reject the entry - the router then
 // resolves nothing while ICMP keeps working. Restore the symlink after every
 // connect and on each watchdog tick.
+// A VLESS/REALITY profile is a TPROXY proxy, not an interface, so the router's
+// own DNS queries never enter the tunnel.  The ISP then answers them - and for
+// filtered names it answers with a block page address - so a working proxy
+// still cannot open the sites it is there for.  Xray exposes a local DNS
+// socket (dns-in) instead, and dnsmasq is pointed at it while such a tunnel is
+// up.  Only the default upstreams are replaced: domain-scoped entries such as
+// /ir/ keep Iranian names on the local resolvers.
+function dns_upstream_path() { return RUN + "/dns-upstream.json"; }
+
+function dns_upstream_read() {
+	let doc = null;
+	try { doc = json(readfile(dns_upstream_path())); } catch (e) { doc = null; }
+	return doc;
+}
+
+function dns_upstream_set(list) {
+	let c = cursor();
+	c.set("dhcp", "@dnsmasq[0]", "server", list);
+	c.commit("dhcp");
+	run("/etc/init.d/dnsmasq reload");
+}
+
+function dns_tunnel_apply(port) {
+	port = intval(port, 0);
+	if (port <= 0) return false;
+	let saved = dns_upstream_read();
+	if (saved == null) {
+		let cur = cursor().get("dhcp", "@dnsmasq[0]", "server");
+		let list = [];
+		if (type(cur) == "array") { for (let s in cur) push(list, "" + s); }
+		else if (cur != null) push(list, "" + cur);
+		saved = { server: list };
+		writefile(dns_upstream_path(), sprintf("%J", saved));
+	}
+	// Keep the scoped servers ("/domain/addr"), replace the default ones.
+	let want = [sprintf("127.0.0.1#%d", port)];
+	for (let s in (saved.server ?? [])) if (index("" + s, "/") == 0) push(want, "" + s);
+	let now = cursor().get("dhcp", "@dnsmasq[0]", "server");
+	let cur = [];
+	if (type(now) == "array") { for (let s in now) push(cur, "" + s); }
+	else if (now != null) push(cur, "" + now);
+	if (join(" ", cur) == join(" ", want)) return true;
+	dns_upstream_set(want);
+	log(sprintf("dns: dnsmasq upstream -> tunnel (127.0.0.1#%d)", port));
+	return true;
+}
+
+function dns_tunnel_clear() {
+	let saved = dns_upstream_read();
+	if (saved == null) return false;
+	dns_upstream_set(saved.server ?? []);
+	run("rm -f " + shellq(dns_upstream_path()));
+	log("dns: dnsmasq upstream restored");
+	return true;
+}
+
+// The watchdog uses this to repair the upstream after a dnsmasq restart.
+function dns_tunnel_active() {
+	let cur = cursor().get("dhcp", "@dnsmasq[0]", "server");
+	let list = [];
+	if (type(cur) == "array") { for (let s in cur) push(list, "" + s); }
+	else if (cur != null) push(list, "" + cur);
+	for (let s in list) if (index(s, "127.0.0.1#") == 0) return true;
+	return false;
+}
+
 function fix_resolv() {
 	let target = "/tmp/resolv.conf.d/resolv.conf.auto";
 	if (!fs.stat(target)) return;
@@ -2046,6 +2118,7 @@ function fix_resolv() {
 	run("/etc/init.d/dnsmasq reload");
 	log("resolver: restored /etc/resolv.conf -> " + target);
 }
+
 
 // ------------------------------------------------------------ connect flow
 
@@ -2092,6 +2165,12 @@ function connect_impl(c, verify) {
 		let rr = routing_apply(up.iface ?? "", up.vip ?? "", up.tproxy ? (up.port ?? 0) : 0);
 		routing.active = rr.ok;
 		if (!rr.ok) log("connect: routing failed: " + rr.error);
+		if (rr.ok && intval(up.tproxy, 0) > 0) {
+			dns_tunnel_apply(up.dns_port ?? XRAY_DNS_PORT);
+		} else if (!intval(up.tproxy, 0)) {
+			// An interface tunnel marks its own DNS traffic, the helper must go.
+			dns_tunnel_clear();
+		}
 	}
 	fix_resolv();
 
@@ -2109,6 +2188,7 @@ function disconnect_impl() {
 	let st = state_read();
 	let c = length(st.conn_id ?? "") ? resolve_target(st.conn_id) : null;
 	routing_clear();
+	dns_tunnel_clear();
 	if (c != null) drv_down(c);
 	else ike_down();
 	fix_resolv();
@@ -2276,6 +2356,10 @@ function supervise_once() {
 			let rr = routing_apply(p.iface ?? "", vip, st.tproxy ?? 0);
 			if (!rr.ok) log("watchdog: routing restore failed: " + (rr.error ?? "unknown"));
 			if (rr.ok) log("watchdog: routing rules restored");
+		}
+		if (intval(st.tproxy, 0) > 0 && !dns_tunnel_active()) {
+			dns_tunnel_apply(XRAY_DNS_PORT);
+			log("watchdog: tunnel DNS upstream restored");
 		}
 		state_patch(patch);
 		return;
