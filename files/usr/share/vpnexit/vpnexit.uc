@@ -2024,6 +2024,7 @@ function routing_clear() {
 	// Literals on purpose: the constants are declared further down.
 	run("ip rule del fwmark 0x1a2 lookup 415 priority 900 2>/dev/null");
 	run("ip route flush table 415");
+	run("nft delete table ip vpnexit_probe_nat");
 	zone_remove();
 }
 
@@ -2067,6 +2068,22 @@ function probe_route_del() {
 	run(sprintf("ip route flush table %d", PROBE_TABLE));
 }
 
+// The LAN path masquerades on the tunnel interface, so it reaches the far side
+// with the tunnel address.  A probe that skips the NAT is not measuring the
+// same path: on SSTP and on the SoftEther gateway the un-NATed stream is
+// dropped after the handshake, which made working tunnels look dead.
+function probe_nat_add(iface) {
+	if (!length(iface ?? "")) return false;
+	run("nft delete table ip vpnexit_probe_nat");
+	run("nft add table ip vpnexit_probe_nat");
+	run("nft add chain ip vpnexit_probe_nat post '{ type nat hook postrouting priority srcnat; policy accept; }'");
+	return run(sprintf("nft add rule ip vpnexit_probe_nat post oifname \"%s\" meta mark %s masquerade", iface, PROBE_MARK)).rc == 0;
+}
+
+function probe_nat_del() {
+	run("nft delete table ip vpnexit_probe_nat");
+}
+
 function probe_ip(marked, iface) {
 	let routed = false;
 	if (marked) {
@@ -2079,6 +2096,7 @@ function probe_ip(marked, iface) {
 		if (length(ep_host)) run("nft add rule inet vpnexit_probe out ip daddr " + ep_host + " return");
 		run("nft add rule inet vpnexit_probe out meta mark set " + PROBE_MARK);
 		routed = probe_route_add(iface);
+		if (routed) probe_nat_add(iface);
 	}
 	// A single, bounded request: a tunnel that does not answer must fail the
 	// check in seconds, not hold the connect open until the web server kills
@@ -2088,6 +2106,7 @@ function probe_ip(marked, iface) {
 	let m = match(trim(r.out ?? ""), /^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$/);
 	if (marked) {
 		if (routed) probe_route_del();
+		probe_nat_del();
 		run("nft delete table inet vpnexit_probe");
 	}
 	return m ? (m[1] ?? m[0]) : "";
@@ -2509,7 +2528,21 @@ function supervise() {
 	if (st.state == "connecting") state_patch({ state: "idle" });
 	log("supervisor started");
 	let last_refresh_check = 0;
+	// The watchdog is a long running interpreter: replacing vpnexit.uc on disk
+	// does not change the code it is executing, so a deployed fix used to stay
+	// inert until the next reboot.  Exit when the file changes and let procd
+	// bring the new version up.
+	let self = "/usr/share/vpnexit/vpnexit.uc";
+	let self_mtime = null;
+	if (fs.stat(self)) self_mtime = fs.stat(self).mtime;
 	while (true) {
+		if (self_mtime != null) {
+			let now_mtime = fs.stat(self) ? fs.stat(self).mtime : null;
+			if (now_mtime != null && now_mtime != self_mtime) {
+				log("supervisor: vpnexit.uc changed on disk, exiting for a restart");
+				exit(0);
+			}
+		}
 		let hours = cfg_int("refresh_hours", 24);
 		if (hours > 0 && now() - last_refresh_check > 600) {
 			last_refresh_check = now();
