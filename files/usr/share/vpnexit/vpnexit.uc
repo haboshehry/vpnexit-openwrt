@@ -2120,8 +2120,14 @@ function probe_path(up) {
 		let ip = http_inbound_ip(8);
 		return { ok: length(ip) > 0, ip: ip, detail: length(ip) ? "exit verified" : "no answer through the proxy" };
 	}
+	// An interface tunnel is only verified when the exit really changes: an
+	// IKEv2 profile whose policy never matched still answers, but with the
+	// uplink address, and that used to be reported as a working tunnel.
+	let direct = probe_ip(false);
 	let ip = probe_ip(true, up.iface ?? "");
-	return { ok: length(ip) > 0, ip: ip, detail: length(ip) ? "exit verified" : "no answer through the tunnel" };
+	if (!length(ip)) return { ok: false, ip: "", direct: direct, detail: "no answer through the tunnel" };
+	if (length(direct) && direct == ip) return { ok: false, ip: ip, direct: direct, detail: "traffic still leaves through the router uplink" };
+	return { ok: true, ip: ip, direct: direct, detail: "exit verified" };
 }
 
 function selftest_internal() {
