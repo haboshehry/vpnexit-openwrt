@@ -22,7 +22,7 @@ const SWANCTL_CONF = "/etc/swanctl/conf.d/vpnexit.conf";
 const SWANCTL_SECRETS = "/etc/swanctl/conf.d/vpnexit-secrets.conf";
 const CONN = "vpnexit";
 const CHILD = "vpnexit";
-const PROBE = "https://1.1.1.1/cdn-cgi/trace";
+const PROBE = "https://www.cloudflare.com/cdn-cgi/trace";
 
 const WGIFACE = "vpnwg0";
 const OVPNIFACE = "ovpnx0";
@@ -1992,16 +1992,16 @@ function probe_ip(marked) {
 		run("nft delete table inet vpnexit_probe");
 		run("nft add table inet vpnexit_probe");
 		run("nft add chain inet vpnexit_probe out '{ type route hook output priority mangle; policy accept; }'");
-		run("nft add rule inet vpnexit_probe out ip daddr 1.1.1.1 meta mark set " + cfg("mark", "0x1a1"));
+		run("nft add rule inet vpnexit_probe out ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 100.64.0.0/10 } return");
+		let s_ip = state_read().server ?? "";
+		let ep_host = split(s_ip, ":")[0] ?? "";
+		if (length(ep_host)) run("nft add rule inet vpnexit_probe out ip daddr " + ep_host + " return");
+		run("nft add rule inet vpnexit_probe out meta mark set " + cfg("mark", "0x1a1"));
 	}
-	// Some OpenWrt builds have a uclient-fetch TLS stack that cannot complete
-	// the 1.1.1.1 HTTPS probe.  Keep it as the preferred check, but fall back
-	// to the plain-HTTP endpoint so health checks still work on BusyBox-only
-	// images.  The mark applies to both commands and is removed afterwards.
 	let r = run("uclient-fetch -q -O - --timeout=12 " + shellq(PROBE));
 	let m = match(r.out, /ip=([0-9.]+)/);
 	if (!m) {
-		r = run("wget -q -O - --timeout=12 http://icanhazip.com");
+		r = run("wget -q -O - --timeout=12 http://ipv4.icanhazip.com");
 		m = match(trim(r.out ?? ""), /^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$/);
 	}
 	if (marked) run("nft delete table inet vpnexit_probe");

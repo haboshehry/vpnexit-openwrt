@@ -65,7 +65,7 @@ if has_type l2tp; then
 	add_pkgs "xl2tpd kmod-l2tp ppp ppp-mod-pppol2tp"
 fi
 if has_type sstp; then
-	add_pkgs "sstp-client ppp"
+	add_pkgs "sstp-client ppp libopenssl-legacy"
 fi
 if has_type wireguard || has_type amneziawg; then
 	add_pkgs "kmod-wireguard wireguard-tools"
