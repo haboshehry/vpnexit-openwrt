@@ -2084,9 +2084,10 @@ function probe_nat_del() {
 	run("nft delete table ip vpnexit_probe_nat");
 }
 
-function probe_ip(marked, iface) {
+function probe_ip(marked, iface, mark) {
 	let routed = false;
 	if (marked) {
+		if (!length(mark ?? "")) mark = PROBE_MARK;
 		run("nft delete table inet vpnexit_probe");
 		run("nft add table inet vpnexit_probe");
 		run("nft add chain inet vpnexit_probe out '{ type route hook output priority mangle; policy accept; }'");
@@ -2094,9 +2095,13 @@ function probe_ip(marked, iface) {
 		let s_ip = state_read().server ?? "";
 		let ep_host = split(s_ip, ":")[0] ?? "";
 		if (length(ep_host)) run("nft add rule inet vpnexit_probe out ip daddr " + ep_host + " return");
-		run("nft add rule inet vpnexit_probe out meta mark set " + PROBE_MARK);
-		routed = probe_route_add(iface);
-		if (routed) probe_nat_add(iface);
+		run("nft add rule inet vpnexit_probe out meta mark set " + mark);
+		// IKEv2 owns no interface: the published LAN routing plus the panel's
+		// own SNAT are the path, so only the mark is needed here.
+		if (length(iface ?? "")) {
+			routed = probe_route_add(iface);
+			if (routed) probe_nat_add(iface);
+		}
 	}
 	// A single, bounded request: a tunnel that does not answer must fail the
 	// check in seconds, not hold the connect open until the web server kills
@@ -2124,7 +2129,7 @@ function probe_path(up) {
 	// IKEv2 profile whose policy never matched still answers, but with the
 	// uplink address, and that used to be reported as a working tunnel.
 	let direct = probe_ip(false);
-	let ip = probe_ip(true, up.iface ?? "");
+	let ip = up.xfrm ? probe_ip(true, "", cfg("mark", "0x1a1")) : probe_ip(true, up.iface ?? "");
 	if (!length(ip)) return { ok: false, ip: "", direct: direct, detail: "no answer through the tunnel" };
 	if (length(direct) && direct == ip) return { ok: false, ip: ip, direct: direct, detail: "traffic still leaves through the router uplink" };
 	return { ok: true, ip: ip, direct: direct, detail: "exit verified" };
@@ -2285,7 +2290,34 @@ function connect_impl(c, verify) {
 	// Prove the data path before the LAN is pointed at it.  Applying the
 	// routing first is what used to take the whole network down for minutes
 	// whenever a tunnel came up but never forwarded anything.
-	let test = probe_path(up);
+	//
+	// IKEv2 is the exception: the server only accepts the assigned VIP as the
+	// inner source, and the router reaches it by SNATting the marked traffic in
+	// postrouting - the ESP policy is then matched on the re-route.  A probe
+	// that runs before that NAT measures the plain uplink, so for xfrm the
+	// routing has to be published first and pulled again if the probe fails.
+	let routing = { active: false };
+	let test = { ok: true, ip: "", detail: "not tested" };
+	let xfrm_first = up.xfrm && cfg_bool("share_lan", true);
+	if (xfrm_first) {
+		let rr = routing_apply("", up.vip ?? "", 0);
+		routing.active = rr.ok;
+		if (!rr.ok) log("connect: routing failed: " + rr.error);
+		test = probe_path(up);
+	} else {
+		test = probe_path(up);
+		if (test.ok && cfg_bool("share_lan", true)) {
+			let rr = routing_apply(up.iface ?? "", up.vip ?? "", up.tproxy ? (up.port ?? 0) : 0);
+			routing.active = rr.ok;
+			if (!rr.ok) log("connect: routing failed: " + rr.error);
+			if (rr.ok && intval(up.tproxy, 0) > 0) {
+				dns_tunnel_apply(up.dns_port ?? XRAY_DNS_PORT);
+			} else if (!intval(up.tproxy, 0)) {
+				// An interface tunnel marks its own DNS traffic, the helper must go.
+				dns_tunnel_clear();
+			}
+		}
+	}
 	if (!test.ok) {
 		let why = test.detail ?? "tunnel did not pass traffic";
 		log("connect: " + why + ", leaving the LAN on its own uplink");
@@ -2294,19 +2326,6 @@ function connect_impl(c, verify) {
 		routing_clear();
 		state_patch({ state: "error", error: why, iface: "", vip: "", exit_ip: "", error_at: now(), checked_at: now(), misses: 0, attempts: 0 });
 		return { ok: false, error: why };
-	}
-
-	let routing = { active: false };
-	if (cfg_bool("share_lan", true)) {
-		let rr = routing_apply(up.iface ?? "", up.vip ?? "", up.tproxy ? (up.port ?? 0) : 0);
-		routing.active = rr.ok;
-		if (!rr.ok) log("connect: routing failed: " + rr.error);
-		if (rr.ok && intval(up.tproxy, 0) > 0) {
-			dns_tunnel_apply(up.dns_port ?? XRAY_DNS_PORT);
-		} else if (!intval(up.tproxy, 0)) {
-			// An interface tunnel marks its own DNS traffic, the helper must go.
-			dns_tunnel_clear();
-		}
 	}
 	fix_resolv();
 	state_patch({ exit_ip: test.ip ?? "", error: "", warning: "", checked_at: now() });
