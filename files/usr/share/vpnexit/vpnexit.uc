@@ -833,6 +833,12 @@ function conn_endpoint(c) {
 	let s = c.config ?? {};
 	if (c.type == "vless") return (s.host ?? "") + ":" + (s.port ?? 443);
 	if (c.type == "wireguard" || c.type == "amneziawg") return s.endpoint ?? "";
+	if (c.type == "openvpn") {
+		// Parsed inline: ovpn_summary is declared further down and ucode
+		// resolves symbols at compile time.
+		let m = match(s.raw ?? "", /(^|\n)[ \t]*remote[ \t]+([^ \t#;]+)([ \t]+([0-9]+))?/);
+		return m ? m[2] + ":" + (m[4] ?? "1194") : "";
+	}
 	if (length(s.server ?? "")) return s.server + (length(s.port ?? "") ? ":" + s.port : "");
 	return s.host ?? "";
 }
@@ -1265,6 +1271,10 @@ function ovpn_prepare(c) {
 	for (let line in split(raw, "\n")) {
 		let t = trim(line);
 		if (match(t, /^(daemon|route-nopull|dev|dev-type|writepid|log|log-append)\b/)) continue;
+		// SoftEther exports carry a bare "auth-user-pass": openvpn then waits
+		// for a terminal that a daemon does not have, and the session hangs.
+		// The credential file is added below whenever the profile has one.
+		if (match(t, /^auth-user-pass\s*$/)) continue;
 		push(lines, line);
 	}
 	push(lines, "");
@@ -1277,8 +1287,17 @@ function ovpn_prepare(c) {
 	push(lines, "persist-key");
 	push(lines, "route-nopull");
 	push(lines, "verb 3");
+	// The keepalive that the server pushes must be honoured: SoftEther drops a
+	// client that stops pinging every three seconds.  Only the pushed routes
+	// and resolvers are filtered - those fight with route-nopull.
+	push(lines, "pull-filter ignore \"dhcp-option\"");
+	push(lines, "pull-filter ignore \"redirect-gateway\"");
 	push(lines, "ping 10");
-	push(lines, "ping-restart 60");
+	push(lines, "ping-restart 120");
+	// A full 1500-byte inner segment cannot cross the outer transport, which
+	// shows up as "ping works, every page hangs".  Clamp the advertised MSS
+	// instead of lowering tun-mtu, so the server's ifconfig stays untouched.
+	push(lines, "mssfix " + (cfg_int("tunnel_mtu", 1400) - 40));
 	if (length(s.username ?? "") || length(s.password ?? "")) {
 		writefile(d + "/auth.txt", (s.username ?? "") + "\n" + (s.password ?? "") + "\n", "0600");
 		push(lines, "auth-user-pass " + d + "/auth.txt");
@@ -1292,7 +1311,12 @@ function ovpn_up(c) {
 	run("ip link del " + OVPNIFACE + " 2>/dev/null");
 	kill_pidfile(d + "/openvpn.pid");
 	kill_match(d + "/client.conf");
-	spawn_bg(sprintf("openvpn --config %s --writepid %s", shellq(d + "/client.conf"), shellq(d + "/openvpn.pid")),
+	// The status file is the only reliable liveness signal: its TCP/UDP
+	// counters move with the keepalive even when the tun is idle, while a
+	// stalled session freezes them.  Interface counters cannot tell the two
+	// apart, which is why a dead tunnel used to stay "connected".
+	spawn_bg(sprintf("openvpn --config %s --writepid %s --status %s 5",
+			shellq(d + "/client.conf"), shellq(d + "/openvpn.pid"), shellq(d + "/openvpn.status")),
 		d + "/openvpn.log", d + "/openvpn.pid");
 	if (!wait_iface(OVPNIFACE, 30)) {
 		kill_pidfile(d + "/openvpn.pid");
@@ -1305,16 +1329,49 @@ function ovpn_down(c) {
 	let d = RUNDIR + "/" + replace(c.id ?? "", /[^A-Za-z0-9_-]/g, "_");
 	kill_pidfile(d + "/openvpn.pid");
 	kill_match(d + "/client.conf");
-	sleep(300);
+	// Wait for the daemon to release the tun.  Deleting the link under a live
+	// openvpn makes the next start fight for ovpnx0 and both sessions starve.
+	for (let i = 0; i < 15; i++) {
+		let left = trim(run("ps w | grep -F " + shellq(d + "/client.conf") + " | grep -v grep | wc -l").out);
+		if (intval(left, 0) == 0) break;
+		sleep(200);
+	}
+	kill_match(d + "/client.conf");
+	sleep(200);
 	run("ip link del " + OVPNIFACE + " 2>/dev/null");
+	run("rm -f " + shellq(d + "/probe.json"));
 }
 
-function ovpn_probe() {
+// "--status" writes a block per refresh; the last one wins.
+function ovpn_status_counters(path) {
+	let r = { rx: 0, tx: 0 };
+	let txt = readfile(path) ?? "";
+	let m = match(txt, /TCP\/UDP read bytes,([0-9]+)/);
+	if (m) r.rx = intval(m[1], 0);
+	m = match(txt, /TCP\/UDP write bytes,([0-9]+)/);
+	if (m) r.tx = intval(m[1], 0);
+	return r;
+}
+
+function ovpn_probe(c) {
 	if (!iface_exists(OVPNIFACE)) return { up: false };
 	let v4 = iface_v4(OVPNIFACE);
 	if (!length(v4)) return { up: false };
+	let d = conn_runtime_dir(c?.id ?? state_read().conn_id ?? "");
+	let s = ovpn_status_counters(d + "/openvpn.status");
+	let prev = null;
+	try { prev = json(readfile(d + "/probe.json")); } catch (e) { prev = null; }
+	let stalled = 0;
+	if (prev != null && s.rx == intval(prev.rx, -1) && s.tx == intval(prev.tx, -1)) stalled = intval(prev.stalled, 0) + 1;
+	writefile(d + "/probe.json", sprintf("%J", { rx: s.rx, tx: s.tx, stalled: stalled, at: now() }), "0600");
+	// Three quiet samples (~60 s at the default watchdog interval) mean the
+	// data channel is gone even though the link is still up.
+	if (stalled >= 3) {
+		log(sprintf("openvpn: no traffic for %d checks, treating the tunnel as down", stalled));
+		return { up: false, stall: true };
+	}
 	let b = iface_bytes(OVPNIFACE);
-	return { up: true, iface: OVPNIFACE, vip: v4, rx: b.rx, tx: b.tx, uptime: 0 };
+	return { up: true, iface: OVPNIFACE, vip: v4, rx: s.rx, tx: s.tx, uptime: 0 };
 }
 
 // ------------------------------------------------------ WireGuard/AmneziaWG
@@ -1963,6 +2020,10 @@ function routing_clear() {
 	}
 	run(sprintf("ip route flush table %d", table));
 	run(sprintf("ip route flush table %d", TPROXY_TABLE));
+	// A connect that was killed mid-probe can leave the probe rule behind.
+	// Literals on purpose: the constants are declared further down.
+	run("ip rule del fwmark 0x1a2 lookup 415 priority 900 2>/dev/null");
+	run("ip route flush table 415");
 	zone_remove();
 }
 
@@ -1987,7 +2048,27 @@ function routing_active() {
 // Declared before the connect flow on purpose: ucode resolves function symbols
 // at compile time, so a call that appears earlier in the file would see null.
 
-function probe_ip(marked) {
+// The probe carries its own mark and routing table: it has to work before the
+// LAN routing is published, otherwise it would silently measure the uplink and
+// "verify" a tunnel that forwards nothing.
+const PROBE_TABLE = 415;
+const PROBE_MARK = "0x1a2";
+
+function probe_route_add(iface) {
+	if (!length(iface ?? "")) return false;
+	run(sprintf("ip route flush table %d", PROBE_TABLE));
+	if (run(sprintf("ip route add default dev %s table %d", iface, PROBE_TABLE)).rc != 0) return false;
+	run(sprintf("ip rule del fwmark %s lookup %d priority 900 2>/dev/null", PROBE_MARK, PROBE_TABLE));
+	return run(sprintf("ip rule add fwmark %s lookup %d priority 900", PROBE_MARK, PROBE_TABLE)).rc == 0;
+}
+
+function probe_route_del() {
+	run(sprintf("ip rule del fwmark %s lookup %d priority 900 2>/dev/null", PROBE_MARK, PROBE_TABLE));
+	run(sprintf("ip route flush table %d", PROBE_TABLE));
+}
+
+function probe_ip(marked, iface) {
+	let routed = false;
 	if (marked) {
 		run("nft delete table inet vpnexit_probe");
 		run("nft add table inet vpnexit_probe");
@@ -1996,16 +2077,32 @@ function probe_ip(marked) {
 		let s_ip = state_read().server ?? "";
 		let ep_host = split(s_ip, ":")[0] ?? "";
 		if (length(ep_host)) run("nft add rule inet vpnexit_probe out ip daddr " + ep_host + " return");
-		run("nft add rule inet vpnexit_probe out meta mark set " + cfg("mark", "0x1a1"));
+		run("nft add rule inet vpnexit_probe out meta mark set " + PROBE_MARK);
+		routed = probe_route_add(iface);
 	}
-	let r = run("uclient-fetch -q -O - --timeout=12 " + shellq(PROBE));
-	let m = match(r.out, /ip=([0-9.]+)/);
-	if (!m) {
-		r = run("wget -q -O - --timeout=12 http://ipv4.icanhazip.com");
-		m = match(trim(r.out ?? ""), /^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$/);
+	// A single, bounded request: a tunnel that does not answer must fail the
+	// check in seconds, not hold the connect open until the web server kills
+	// it.  uclient-fetch cannot do TLS to Cloudflare on this image, so the
+	// plain HTTP endpoint is the measurement.
+	let r = run("wget -t 1 -T 8 -q -O - http://ipv4.icanhazip.com");
+	let m = match(trim(r.out ?? ""), /^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$/);
+	if (marked) {
+		if (routed) probe_route_del();
+		run("nft delete table inet vpnexit_probe");
 	}
-	if (marked) run("nft delete table inet vpnexit_probe");
 	return m ? (m[1] ?? m[0]) : "";
+}
+
+// Measures the tunnel itself.  The interface path uses a marked probe, which
+// only involves a temporary output chain, so the LAN default route is left
+// alone; the proxy path is measured through the local http inbound.
+function probe_path(up) {
+	if (intval(up.tproxy ?? 0) > 0) {
+		let ip = http_inbound_ip(8);
+		return { ok: length(ip) > 0, ip: ip, detail: length(ip) ? "exit verified" : "no answer through the proxy" };
+	}
+	let ip = probe_ip(true, up.iface ?? "");
+	return { ok: length(ip) > 0, ip: ip, detail: length(ip) ? "exit verified" : "no answer through the tunnel" };
 }
 
 function selftest_internal() {
@@ -2031,7 +2128,7 @@ function selftest_internal() {
 		return { ok: true, ip: via, direct: plain, detail: "exit verified" };
 	}
 	let direct = probe_ip(false);
-	let marked = probe_ip(true);
+	let marked = probe_ip(true, st.iface ?? "");
 	if (down_rules) routing_clear();
 	if (!length(marked)) return { ok: false, detail: "no answer through the tunnel", direct: direct };
 	if (length(direct) && direct == marked) return { ok: false, detail: "traffic still leaves through the router uplink", direct: direct };
@@ -2160,6 +2257,20 @@ function connect_impl(c, verify) {
 	});
 	if (length(up.degraded ?? "")) log("connect: warning " + up.degraded);
 
+	// Prove the data path before the LAN is pointed at it.  Applying the
+	// routing first is what used to take the whole network down for minutes
+	// whenever a tunnel came up but never forwarded anything.
+	let test = probe_path(up);
+	if (!test.ok) {
+		let why = test.detail ?? "tunnel did not pass traffic";
+		log("connect: " + why + ", leaving the LAN on its own uplink");
+		if (cfg_bool("share_lan", true)) dns_tunnel_clear();
+		drv_down(c);
+		routing_clear();
+		state_patch({ state: "error", error: why, iface: "", vip: "", exit_ip: "", error_at: now(), checked_at: now(), misses: 0, attempts: 0 });
+		return { ok: false, error: why };
+	}
+
 	let routing = { active: false };
 	if (cfg_bool("share_lan", true)) {
 		let rr = routing_apply(up.iface ?? "", up.vip ?? "", up.tproxy ? (up.port ?? 0) : 0);
@@ -2173,14 +2284,9 @@ function connect_impl(c, verify) {
 		}
 	}
 	fix_resolv();
-
-	let test = { ok: false, detail: "not tested" };
-	if (verify && cfg_bool("share_lan", true)) test = selftest_internal();
-	let warn = "";
-	if (verify && cfg_bool("share_lan", true) && !test.ok) warn = test.detail ?? "self-test failed";
-	state_patch({ exit_ip: test.ip ?? "", error: "", warning: warn, checked_at: now() });
+	state_patch({ exit_ip: test.ip ?? "", error: "", warning: "", checked_at: now() });
 	log(sprintf("connect: up, iface %s, vip %s, exit %s", up.iface ?? "xfrm", up.vip ?? "-", test.ip ?? "-"));
-	return { ok: true, iface: up.iface ?? "", vip: up.vip ?? "", exit_ip: test.ip ?? "", warning: warn, routing: routing.active };
+	return { ok: true, iface: up.iface ?? "", vip: up.vip ?? "", exit_ip: test.ip ?? "", warning: "", routing: routing.active };
 }
 
 function disconnect_impl() {
@@ -2348,6 +2454,12 @@ function supervise_once() {
 	}
 
 	let p = drv_probe(c);
+	// A session that is up but silent would blackhole the LAN, so take the
+	// routing away at the first sign of a stall instead of waiting.
+	if (p.stall && routing_active()) {
+		routing_clear();
+		log("watchdog: tunnel stalled, LAN routing removed");
+	}
 	if (p.up) {
 		fix_resolv();
 		let vip = length(p.vip ?? "") ? p.vip : (st.vip ?? "");
