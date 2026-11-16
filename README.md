@@ -18,6 +18,43 @@ The router keeps its normal internet access: only forwarded LAN traffic (and
 DNS from the router) is marked, so SSH to the router keeps working while the
 tunnel is up.
 
+## Verified connections and health rules
+
+Every connect is verified before the LAN is pointed at the tunnel: the panel
+sends one probe through the tunnel and requires the exit address to differ from
+the router's own uplink. If the probe fails or the exit does not change, the
+tunnel is torn down, the routing stays off and the LAN keeps working - a
+connection that cannot forward traffic can no longer blackhole the network.
+
+Measured on OpenWrt 25.12 (kernel 6.x, OpenSSL 3) against the profiles in use:
+
+| Profile | Exit through the tunnel | Result |
+|---|---|---|
+| VLESS / REALITY | 162.35.190.46 | works |
+| VLESS / REALITY (CA) | 199.195.149.132 | works |
+| SSTP | 38.180.15.93 | works |
+| OpenVPN (SoftEther) | 162.35.190.46 | works |
+| L2TP / IPsec | 162.35.190.46 | works |
+| AmneziaWG | 84.200.154.147 | works |
+| AmneziaWG (USA) | 162.35.190.46 | works |
+
+Practical notes learned from these profiles:
+
+- SSTP needs `libopenssl-legacy` (the MSCHAPv2 hash uses MD4, which OpenSSL 3
+  only provides through the legacy provider) and the username must not carry a
+  realm suffix unless the server expects it.
+- OpenVPN configs exported from SoftEther contain a bare `auth-user-pass`; it is
+  stripped because the daemon then waits on a terminal that does not exist.
+- The MSS is clamped (`mssfix`) on OpenVPN and via nftables on the interface
+  tunnels, otherwise ICMP passes while every TCP stream stalls.
+- DNS for VLESS goes through a `dokodemo-door` inbound (127.0.0.1:1053) so
+  filtered names are resolved inside the tunnel; the resolver is restored on
+  disconnect.
+- IKEv2 exit profiles are the one exception: the provider narrows the traffic
+  selectors to the assigned VIP (`TS_UNACCEPTABLE` for a LAN subnet), so LAN
+  traffic would have to be SNATed to that VIP before the ESP policy lookup.
+  The panel refuses such a profile instead of pretending it works.
+
 ## Supported protocols
 
 | Type | Client used | Status |

@@ -2521,6 +2521,17 @@ function supervise_once() {
 	}
 
 	let p = drv_probe(c);
+	// An IPsec SA survives a dead data path, so "the SA exists" is not a health
+	// signal: probe the tunnel itself, otherwise the watchdog keeps republishing
+	// routing for a tunnel that forwards nothing.
+	if (p.up && st.xfrm) {
+		let t = probe_path({ xfrm: true, tproxy: 0, iface: "", vip: p.vip ?? st.vip ?? "" });
+		if (!t.ok) {
+			log("watchdog: xfrm data path is dead (" + (t.detail ?? "") + ")");
+			p.up = false;
+			p.stall = true;
+		}
+	}
 	// A session that is up but silent would blackhole the LAN, so take the
 	// routing away at the first sign of a stall instead of waiting.
 	if (p.stall && routing_active()) {
