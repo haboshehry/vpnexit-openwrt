@@ -287,10 +287,20 @@ function resolve4(host) {
 	if (match(host ?? "", /^[0-9.]+$/)) return host;
 	let r = run("nslookup " + shellq(host));
 	let out = [];
+	let answer = false;
 	for (let line in split(r.out, "\n")) {
-		let m = match(line, /Address:\s*([0-9.]+)/);
+		// BusyBox nslookup prints the resolver address before the answer:
+		//   Address: 192.168.1.1
+		//   Name: example.com
+		//   Address: 203.0.113.10
+		// Only collect A records after the Name: section; otherwise the
+		// tunnel probe can accidentally mark the DNS server itself.
+		if (match(trim(line), /^Name\s*:/i)) { answer = true; continue; }
+		if (!answer) continue;
+		let m = match(trim(line), /^Address(\s+[0-9]+)?\s*:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/i);
 		if (!m) continue;
-		if (index(out, m[1]) < 0) push(out, m[1]);
+		let ip = m[2] ?? m[1];
+		if (index(out, ip) < 0) push(out, ip);
 		if (length(out) >= 4) break;
 	}
 	return length(out) ? out[0] : "";
