@@ -2208,11 +2208,13 @@ function dns_upstream_read() {
 	return doc;
 }
 
-function dns_upstream_set(list) {
+function dns_upstream_set(list, noresolv, rebind_protection) {
 	let c = cursor();
 	c.set("dhcp", "@dnsmasq[0]", "server", list);
+	if (noresolv != null) c.set("dhcp", "@dnsmasq[0]", "noresolv", noresolv ? "1" : "0");
+	if (rebind_protection != null) c.set("dhcp", "@dnsmasq[0]", "rebind_protection", rebind_protection ? "1" : "0");
 	c.commit("dhcp");
-	run("/etc/init.d/dnsmasq reload");
+	run("/etc/init.d/dnsmasq restart");
 }
 
 function dns_tunnel_apply(port) {
@@ -2222,9 +2224,22 @@ function dns_tunnel_apply(port) {
 	if (saved == null) {
 		let cur = cursor().get("dhcp", "@dnsmasq[0]", "server");
 		let list = [];
-		if (type(cur) == "array") { for (let s in cur) push(list, "" + s); }
-		else if (cur != null) push(list, "" + cur);
-		saved = { server: list };
+		if (type(cur) == "array") {
+			for (let s in cur) {
+				let str = "" + s;
+				// Filter out any stale tunnel upstream (e.g. 127.0.0.1#1053) so we don't save it as direct default
+				if (index(str, "127.0.0.1#") != 0) push(list, str);
+			}
+		} else if (cur != null && index("" + cur, "127.0.0.1#") != 0) {
+			push(list, "" + cur);
+		}
+		let nores = cursor().get("dhcp", "@dnsmasq[0]", "noresolv");
+		let rebind = cursor().get("dhcp", "@dnsmasq[0]", "rebind_protection");
+		saved = {
+			server: list,
+			noresolv: (nores == "1" || nores == 1 || nores == true),
+			rebind_protection: (rebind == "1" || rebind == 1 || rebind == true || rebind == null)
+		};
 		writefile(dns_upstream_path(), sprintf("%J", saved));
 	}
 	// Keep the scoped servers ("/domain/addr"), replace the default ones.
@@ -2234,16 +2249,17 @@ function dns_tunnel_apply(port) {
 	let cur = [];
 	if (type(now) == "array") { for (let s in now) push(cur, "" + s); }
 	else if (now != null) push(cur, "" + now);
-	if (join(" ", cur) == join(" ", want)) return true;
-	dns_upstream_set(want);
-	log(sprintf("dns: dnsmasq upstream -> tunnel (127.0.0.1#%d)", port));
+	// noresolv=1 ensures dnsmasq ignores WAN resolvers; rebind_protection=0
+	// prevents OpenWrt from dropping responses containing Cloudflare/Google IPs.
+	dns_upstream_set(want, true, false);
+	log(sprintf("dns: dnsmasq upstream -> tunnel (127.0.0.1#%d, noresolv=1, rebind=0)", port));
 	return true;
 }
 
 function dns_tunnel_clear() {
 	let saved = dns_upstream_read();
 	if (saved == null) return false;
-	dns_upstream_set(saved.server ?? []);
+	dns_upstream_set(saved.server ?? [], saved.noresolv ?? false, saved.rebind_protection ?? true);
 	run("rm -f " + shellq(dns_upstream_path()));
 	log("dns: dnsmasq upstream restored");
 	return true;
